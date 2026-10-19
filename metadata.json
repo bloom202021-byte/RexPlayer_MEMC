@@ -1,0 +1,6 @@
+{
+  "name": "REX Player — Material You Video Player & MEMC",
+  "description": "Android Material You (M3) styled video player with real-time motion estimation frame interpolation (MEMC), Web Audio equalizer, subtitle engine, and playlist support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
