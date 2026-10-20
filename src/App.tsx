@@ -75,12 +75,26 @@ interface LibraryVideoItem {
   size: string;
   sourceLabel: string;
   resolution?: string;
+  thumbnailUrl?: string;
 }
 
 const STAGE_W = 960;
 const STAGE_H = 540;
-const FLOW_COLS = 64;
-const FLOW_ROWS = 36;
+const FLOW_COLS = 96;
+const FLOW_ROWS = 54;
+
+// Canonical video frame intervals (23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60 FPS)
+// Snaps noisy decoder timestamps to exact frame cadence to eliminate VSync PLL micro-stutter
+const snapToCanonicalCadenceMs = (rawIntervalMs: number): number => {
+  const canonicals = [41.7083, 41.6667, 40.0, 33.3667, 33.3333, 20.8333, 20.0, 16.6833, 16.6667];
+  for (let i = 0; i < canonicals.length; i++) {
+    const c = canonicals[i];
+    if (Math.abs(rawIntervalMs - c) <= c * 0.055) {
+      return c * 0.75 + rawIntervalMs * 0.25;
+    }
+  }
+  return rawIntervalMs;
+};
 
 export default function App() {
   // Load persisted settings synchronously once on startup so nothing resets on exit
@@ -150,18 +164,20 @@ export default function App() {
   const [hdrEnabled, setHdrEnabled] = useState<boolean>(initCfg.hdrEnabled);
   const [hdrStrength, setHdrStrength] = useState<number>(initCfg.hdrStrength);
   const [upscaleEnabled, setUpscaleEnabled] = useState<boolean>(initCfg.upscaleEnabled);
-  const [upscaleMode, setUpscaleMode] = useState<'fsr' | 'gsr' | 'anime4k' | 'cinema'>(
+  const [upscaleMode, setUpscaleMode] = useState<'gsr' | 'fsr' | 'anime4k' | 'cinema'>(
     initCfg.upscaleMode
   );
-  const [upscaleFactor, setUpscaleFactor] = useState<1.5 | 2.0 | 4.0>(initCfg.upscaleFactor);
+  const [upscaleFactor, setUpscaleFactor] = useState<'auto' | 1.5 | 2.0 | 4.0>(
+    initCfg.upscaleFactor
+  );
   const [upscaleSharpness, setUpscaleSharpness] = useState<number>(initCfg.upscaleSharpness);
   const [upscaleDenoise, setUpscaleDenoise] = useState<number>(initCfg.upscaleDenoise);
   const [adrenoMode, setAdrenoMode] = useState<'auto' | 'on' | 'off'>(initCfg.adrenoMode);
   const [adrenoGmemFp16, setAdrenoGmemFp16] = useState<boolean>(initCfg.adrenoGmemFp16);
   const [adrenoTrue10Hdr, setAdrenoTrue10Hdr] = useState<boolean>(initCfg.adrenoTrue10Hdr);
-  const [flowScaleMode, setFlowScaleMode] = useState<'auto' | 'performance' | 'balanced' | 'ultra'>(
-    initCfg.flowScaleMode || 'auto'
-  );
+  const [flowScaleMode, setFlowScaleMode] = useState<
+    'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme'
+  >(initCfg.flowScaleMode || 'auto');
   const [detectedGpuInfo, setDetectedGpuInfo] = useState<{
     vendor: string;
     renderer: string;
@@ -201,6 +217,15 @@ export default function App() {
   const [motionScale, setMotionScale] = useState<number>(initCfg.motionScale);
   const [dejudderHaloControl, setDejudderHaloControl] = useState<number>(
     initCfg.dejudderHaloControl
+  );
+  const [subframeCascadeEnabled, setSubframeCascadeEnabled] = useState<boolean>(
+    initCfg.subframeCascadeEnabled ?? true
+  );
+  const [subframeCascadeMode, setSubframeCascadeMode] = useState<'auto' | '2x' | '3x' | '4x'>(
+    initCfg.subframeCascadeMode || 'auto'
+  );
+  const [subframeCoherenceGuard, setSubframeCoherenceGuard] = useState<number>(
+    initCfg.subframeCoherenceGuard ?? 75
   );
   const [detectedDisplayHz, setDetectedDisplayHz] = useState<number>(
     initCfg.detectedDisplayHz || 60
@@ -246,6 +271,25 @@ export default function App() {
   }, []);
 
   const effectiveTargetFps = targetFps === 'auto' ? detectedDisplayHz : targetFps;
+
+  const effectiveSubframeCascadeMult: 2 | 3 | 4 =
+    subframeCascadeMode === '2x'
+      ? 2
+      : subframeCascadeMode === '3x'
+      ? 3
+      : subframeCascadeMode === '4x'
+      ? 4
+      : effectiveTargetFps >= 120
+      ? 4
+      : effectiveTargetFps >= 90
+      ? 3
+      : 2;
+
+  const subframeCascadeLabel = !subframeCascadeEnabled
+    ? 'Каскад Выкл'
+    : subframeCascadeMode === 'auto'
+    ? `Авто (${effectiveSubframeCascadeMult}x Sub-FBO)`
+    : `${subframeCascadeMode} Sub-FBO`;
 
   // Telemetry initial state (updated via direct DOM refs during playback for 0 React re-render overhead)
   const [liveScreenHz] = useState(60);
@@ -392,6 +436,47 @@ export default function App() {
     adrenoMode === 'on' ||
     (adrenoMode === 'auto' && (detectedGpuInfo.isAdreno || upscaleMode === 'gsr'));
 
+  // Dynamically detect optimal smartphone screen super-resolution factor based on physical screen pixels & DPR
+  // (reacts to orientation changes and foldable screen transitions)
+  const [detectedMobileScaleFactor, setDetectedMobileScaleFactor] = useState<1.5 | 2.0 | 4.0>(() => {
+    if (typeof window === 'undefined') return 2.0;
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const maxScreenDim = Math.max(
+      window.screen?.width || 0,
+      window.screen?.height || 0,
+      window.innerWidth || 0
+    );
+    const physLongEdge = maxScreenDim * dpr;
+    if (physLongEdge >= 3200 || dpr >= 3.2) return 4.0;
+    if (physLongEdge >= 2160 || dpr >= 2.0) return 2.0;
+    return 1.5;
+  });
+
+  useEffect(() => {
+    const updateMobileScale = () => {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const maxScreenDim = Math.max(
+        window.screen?.width || 0,
+        window.screen?.height || 0,
+        window.innerWidth || 0
+      );
+      const physLongEdge = maxScreenDim * dpr;
+      const next: 1.5 | 2.0 | 4.0 =
+        physLongEdge >= 3200 || dpr >= 3.2 ? 4.0 : physLongEdge >= 2160 || dpr >= 2.0 ? 2.0 : 1.5;
+      setDetectedMobileScaleFactor((prev) => (prev !== next ? next : prev));
+      forceRedrawRef.current = true;
+    };
+    window.addEventListener('resize', updateMobileScale);
+    window.addEventListener('orientationchange', updateMobileScale);
+    return () => {
+      window.removeEventListener('resize', updateMobileScale);
+      window.removeEventListener('orientationchange', updateMobileScale);
+    };
+  }, []);
+
+  const effectiveUpscaleFactor: 1.5 | 2.0 | 4.0 =
+    upscaleFactor === 'auto' ? detectedMobileScaleFactor : upscaleFactor;
+
   const upscaleModeLabel =
     upscaleMode === 'gsr'
       ? 'GSR'
@@ -400,6 +485,21 @@ export default function App() {
       : upscaleMode === 'anime4k'
       ? 'ANIME4K'
       : 'CINEMA';
+
+  const upscaleFactorLabel =
+    upscaleFactor === 'auto'
+      ? `Авто (${
+          effectiveUpscaleFactor === 4.0
+            ? '4K UHD'
+            : effectiveUpscaleFactor === 2.0
+            ? 'QHD 2K'
+            : 'FHD+'
+        } • ${effectiveUpscaleFactor}x)`
+      : upscaleFactor === 1.5
+      ? 'FHD+ (1.5x)'
+      : upscaleFactor === 2.0
+      ? 'QHD 2K (2.0x)'
+      : '4K UHD (4.0x)';
 
   // Automatic persistence of all user settings to localStorage
   useEffect(() => {
@@ -435,6 +535,9 @@ export default function App() {
       interpStrength,
       motionScale,
       dejudderHaloControl,
+      subframeCascadeEnabled,
+      subframeCascadeMode,
+      subframeCoherenceGuard,
       detectedDisplayHz,
       monochromeFilter,
       showVectors,
@@ -495,6 +598,9 @@ export default function App() {
     interpStrength,
     motionScale,
     dejudderHaloControl,
+    subframeCascadeEnabled,
+    subframeCascadeMode,
+    subframeCoherenceGuard,
     detectedDisplayHz,
     monochromeFilter,
     showVectors,
@@ -557,6 +663,7 @@ export default function App() {
     upscaleEnabled,
     upscaleMode,
     upscaleFactor,
+    effectiveUpscaleFactor,
     upscaleSharpness,
     upscaleDenoise,
     isAdrenoActive,
@@ -570,6 +677,10 @@ export default function App() {
     interpStrength,
     motionScale,
     dejudderHaloControl,
+    subframeCascadeEnabled,
+    subframeCascadeMode,
+    effectiveSubframeCascadeMult,
+    subframeCoherenceGuard,
     detectedDisplayHz,
     monochromeFilter,
     showVectors,
@@ -602,6 +713,7 @@ export default function App() {
       upscaleEnabled,
       upscaleMode,
       upscaleFactor,
+      effectiveUpscaleFactor,
       upscaleSharpness,
       upscaleDenoise,
       isAdrenoActive,
@@ -615,6 +727,10 @@ export default function App() {
       interpStrength,
       motionScale,
       dejudderHaloControl,
+      subframeCascadeEnabled,
+      subframeCascadeMode,
+      effectiveSubframeCascadeMult,
+      subframeCoherenceGuard,
       detectedDisplayHz,
       monochromeFilter,
       showVectors,
@@ -647,6 +763,7 @@ export default function App() {
     upscaleEnabled,
     upscaleMode,
     upscaleFactor,
+    effectiveUpscaleFactor,
     upscaleSharpness,
     upscaleDenoise,
     isAdrenoActive,
@@ -660,6 +777,10 @@ export default function App() {
     interpStrength,
     motionScale,
     dejudderHaloControl,
+    subframeCascadeEnabled,
+    subframeCascadeMode,
+    effectiveSubframeCascadeMult,
+    subframeCoherenceGuard,
     detectedDisplayHz,
     monochromeFilter,
     showVectors,
@@ -922,6 +1043,144 @@ export default function App() {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${d}`;
   };
 
+  // Automatic Background Video Preview Thumbnail & Metadata Extractor (320x180 JPEG DataURL)
+  const generateVideoThumbnail = useCallback((videoUrl: string, videoId: string) => {
+    if (!videoUrl) return;
+    const tempVid = document.createElement('video');
+    tempVid.preload = 'metadata';
+    tempVid.muted = true;
+    tempVid.playsInline = true;
+    if (videoUrl.startsWith('http://') || videoUrl.startsWith('https://')) {
+      tempVid.crossOrigin = 'anonymous';
+    }
+
+    let finished = false;
+    const cleanup = () => {
+      if (finished) return;
+      finished = true;
+      try {
+        tempVid.pause();
+        tempVid.removeAttribute('src');
+        tempVid.load();
+      } catch {
+        // Ignore
+      }
+    };
+
+    const timeoutId = window.setTimeout(cleanup, 9000);
+
+    tempVid.onloadedmetadata = () => {
+      if (finished) return;
+      const dur = isFinite(tempVid.duration) && tempVid.duration > 0 ? tempVid.duration : 0;
+      const vw = tempVid.videoWidth || 0;
+      const vh = tempVid.videoHeight || 0;
+      const resStr = vw > 0 && vh > 0 ? `${vw}×${vh}` : undefined;
+
+      if (dur > 0 || resStr) {
+        setUserVideos((prev) =>
+          prev.map((v) =>
+            v.id === videoId
+              ? {
+                  ...v,
+                  duration: dur > 0 ? dur : v.duration,
+                  resolution: resStr || v.resolution
+                }
+              : v
+          )
+        );
+        setPlaylist((prev) =>
+          prev.map((v) =>
+            v.id === videoId
+              ? {
+                  ...v,
+                  duration: dur > 0 ? dur : v.duration,
+                  resolution: resStr || v.resolution
+                }
+              : v
+          )
+        );
+        void updateVideoMetaInVault(videoId, dur, resStr);
+      }
+
+      // Seek into a representative frame (~1.2s or 15% of video) to avoid black fade-in frames
+      const targetTime = dur > 2.0 ? Math.min(2.5, Math.max(0.8, dur * 0.15)) : Math.min(0.2, dur * 0.5);
+      try {
+        tempVid.currentTime = targetTime;
+      } catch {
+        cleanup();
+        window.clearTimeout(timeoutId);
+      }
+    };
+
+    tempVid.onseeked = () => {
+      if (finished) return;
+      try {
+        const vw = tempVid.videoWidth || 320;
+        const vh = tempVid.videoHeight || 180;
+        const thumbW = 320;
+        const thumbH = 180;
+        const canvas = document.createElement('canvas');
+        canvas.width = thumbW;
+        canvas.height = thumbH;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#09090c';
+          ctx.fillRect(0, 0, thumbW, thumbH);
+          const scale = Math.max(thumbW / Math.max(1, vw), thumbH / Math.max(1, vh));
+          const drawW = vw * scale;
+          const drawH = vh * scale;
+          const dx = (thumbW - drawW) * 0.5;
+          const dy = (thumbH - drawH) * 0.5;
+          ctx.drawImage(tempVid, dx, dy, drawW, drawH);
+
+          const thumbDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+          const dur = isFinite(tempVid.duration) && tempVid.duration > 0 ? tempVid.duration : 0;
+          const resStr = vw > 0 && vh > 0 ? `${vw}×${vh}` : undefined;
+
+          if (thumbDataUrl && thumbDataUrl.length > 128) {
+            setUserVideos((prev) =>
+              prev.map((v) =>
+                v.id === videoId
+                  ? {
+                      ...v,
+                      duration: dur > 0 ? dur : v.duration,
+                      resolution: resStr || v.resolution,
+                      thumbnailUrl: thumbDataUrl
+                    }
+                  : v
+              )
+            );
+            setPlaylist((prev) =>
+              prev.map((v) =>
+                v.id === videoId
+                  ? {
+                      ...v,
+                      duration: dur > 0 ? dur : v.duration,
+                      resolution: resStr || v.resolution,
+                      thumbnailUrl: thumbDataUrl
+                    }
+                  : v
+              )
+            );
+            void updateVideoMetaInVault(videoId, dur, resStr, thumbDataUrl);
+          }
+        }
+      } catch {
+        // Ignore cross-origin canvas taint if remote URL
+      } finally {
+        window.clearTimeout(timeoutId);
+        cleanup();
+      }
+    };
+
+    tempVid.onerror = () => {
+      window.clearTimeout(timeoutId);
+      cleanup();
+    };
+
+    tempVid.src = videoUrl;
+  }, []);
+
   // Unified helper for accurate seeking (updates video, state, DOM scrubbers, and triggers WebGL redraw even when paused)
   const seekToTime = useCallback(
     (targetSec: number) => {
@@ -949,6 +1208,23 @@ export default function App() {
       if (fsScrubberInputRef.current) {
         fsScrubberInputRef.current.value = String(clamped);
       }
+      if (subtitleBoxRef.current && subtitleTextSpanRef.current) {
+        if (!subtitlesEnabled || !subtitleCues.length) {
+          subtitleBoxRef.current.style.display = 'none';
+        } else {
+          const adjTime = clamped - subDelaySec;
+          let cueText = '';
+          for (let i = 0; i < subtitleCues.length; i++) {
+            const c = subtitleCues[i];
+            if (adjTime >= c.start && adjTime <= c.end) {
+              cueText = c.text;
+              break;
+            }
+          }
+          subtitleTextSpanRef.current.textContent = cueText;
+          subtitleBoxRef.current.style.display = cueText ? 'flex' : 'none';
+        }
+      }
       if (rememberPosition && !isDemoTestActive) {
         if (activeVideoKeyRef.current) {
           savedPositionsRef.current[activeVideoKeyRef.current] = clamped;
@@ -959,7 +1235,7 @@ export default function App() {
         saveSavedPositions(savedPositionsRef.current);
       }
     },
-    [duration, hasLoadedVideo, isDemoTestActive, rememberPosition]
+    [duration, hasLoadedVideo, isDemoTestActive, rememberPosition, subDelaySec, subtitleCues, subtitlesEnabled]
   );
 
   // Built-in 24.0 FPS Cinema Motion Test Stream for instant visual verification of 60/90/120/144 FPS MEMC synthesis
@@ -1016,13 +1292,14 @@ export default function App() {
       rVfcPendingRef.current = false;
       rVfcActiveRef.current = true;
       const mediaDelta = Math.abs(meta.mediaTime - lastMediaTimeRef.current);
-      if (lastMediaTimeRef.current < 0 || mediaDelta > 0.004) {
+      if (lastMediaTimeRef.current < 0 || mediaDelta > 0.002) {
         if (lastMediaTimeRef.current >= 0 && mediaDelta < 0.25) {
           const rate = Math.max(0.25, engineConfigRef.current.playbackRate || 1.0);
-          const frameDurMs = (mediaDelta * 1000) / rate;
-          if (frameDurMs >= 12 && frameDurMs <= 85) {
+          const rawFrameDurMs = (mediaDelta * 1000) / rate;
+          if (rawFrameDurMs >= 12 && rawFrameDurMs <= 85) {
+            const stabilizedDurMs = snapToCanonicalCadenceMs(rawFrameDurMs) * rate;
             estimatedFrameIntervalMsRef.current =
-              estimatedFrameIntervalMsRef.current * 0.78 + frameDurMs * 0.22;
+              estimatedFrameIntervalMsRef.current * 0.85 + stabilizedDurMs * 0.15;
           }
         }
         lastMediaTimeRef.current = meta.mediaTime;
@@ -1142,7 +1419,7 @@ export default function App() {
           );
         }
         if (videoId) {
-          updateVideoMetaInVault(videoId, validDur, resStr);
+          void updateVideoMetaInVault(videoId, validDur, resStr);
         }
 
         armVideoFrameCallback();
@@ -1165,6 +1442,7 @@ export default function App() {
       };
 
       vid.onseeked = () => {
+        armVideoFrameCallback();
         hasNewVideoFrameRef.current = true;
         lastDecodedPerfNowRef.current = performance.now();
         lastKeyframeUploadPerfNowRef.current = performance.now();
@@ -1222,8 +1500,12 @@ export default function App() {
             duration: rec.duration || 0,
             size: rec.size,
             sourceLabel: rec.sourceLabel,
-            resolution: rec.resolution
+            resolution: rec.resolution,
+            thumbnailUrl: rec.thumbnailDataUrl
           });
+          if (!rec.thumbnailDataUrl) {
+            generateVideoThumbnail(liveUrl, rec.id);
+          }
         }
 
         if (hydrated.length > 0) {
@@ -1406,11 +1688,10 @@ export default function App() {
     const outCanvas = renderCanvasRef.current;
     const gl = outCanvas
       ? ((outCanvas.getContext('webgl', {
-          alpha: true,
+          alpha: false,
           antialias: false,
           depth: false,
           stencil: false,
-          desynchronized: true,
           preserveDrawingBuffer: false,
           powerPreference: 'high-performance'
         }) || outCanvas.getContext('experimental-webgl')) as WebGLRenderingContext | null)
@@ -1428,9 +1709,12 @@ export default function App() {
     };
 
     const onContextRestored = () => {
+      initGlResources();
       setWebglContextLost(false);
-      showToast('WebGL контекст восстановлен');
+      lastDecodedVideoTimeRef.current = -1;
+      hasNewVideoFrameRef.current = true;
       forceRedrawRef.current = true;
+      showToast('WebGL контекст и шейдеры восстановлены');
     };
 
     if (outCanvas) {
@@ -1443,8 +1727,8 @@ export default function App() {
     let synthProg: WebGLProgram | null = null;
     let quadBuf: WebGLBuffer | null = null;
     let meshBuf: WebGLBuffer | null = null;
-    const MESH_COLS = 64;
-    const MESH_ROWS = 36;
+    const MESH_COLS = 160;
+    const MESH_ROWS = 90;
     const meshVertexCount = MESH_COLS * MESH_ROWS * 6;
     let flowPosLoc = 0;
     let synthPosLoc = 0;
@@ -1455,11 +1739,25 @@ export default function App() {
     let allocatedTexW = STAGE_W;
     let allocatedTexH = STAGE_H;
 
-    // 3-Level Coarse-to-Fine Pyramid FBOs (L2: 16x9, L1: 32x18, L0: Adaptive 64x36) + Pass 1 SAD Heatmap Debug FBO
-    const PYR_L2_COLS = 16;
-    const PYR_L2_ROWS = 9;
-    const PYR_L1_COLS = 32;
-    const PYR_L1_ROWS = 18;
+    // Pass 2A Secondary Sub-Frame Anchor FBO (glSubframeMidFbo stores stabilized I_0.5 intermediate keyframe)
+    let glSubframeMidTex: WebGLTexture | null = null;
+    let glSubframeMidFbo: WebGLFramebuffer | null = null;
+    let allocatedSubframeW = STAGE_W;
+    let allocatedSubframeH = STAGE_H;
+
+    // 5-Level Coarse-to-Fine Pyramid FBOs (L4: 16x9, L3: 32x18, L2: 64x36, L1: 128x72, L0: Adaptive up to 256x144) + Pass 1 SAD Heatmap Debug FBO
+    const PYR_L4_COLS = 16;
+    const PYR_L4_ROWS = 9;
+    const PYR_L3_COLS = 32;
+    const PYR_L3_ROWS = 18;
+    const PYR_L2_COLS = 64;
+    const PYR_L2_ROWS = 36;
+    const PYR_L1_COLS = 128;
+    const PYR_L1_ROWS = 72;
+    let glPyrL4Tex: WebGLTexture | null = null;
+    let glPyrL4Fbo: WebGLFramebuffer | null = null;
+    let glPyrL3Tex: WebGLTexture | null = null;
+    let glPyrL3Fbo: WebGLFramebuffer | null = null;
     let glPyrL2Tex: WebGLTexture | null = null;
     let glPyrL2Fbo: WebGLFramebuffer | null = null;
     let glPyrL1Tex: WebGLTexture | null = null;
@@ -1473,7 +1771,7 @@ export default function App() {
     let allocatedFlowCols = FLOW_COLS;
     let allocatedFlowRows = FLOW_ROWS;
 
-    // Pass 1 (3-Level Coarse-to-Fine Pyramid Optical Flow & Symmetric SAD Debug) Uniform Locations
+    // Pass 1 (4-Level Coarse-to-Fine Pyramid Optical Flow & Symmetric SAD Debug) Uniform Locations
     let uFlowSceneCutLoc: WebGLUniformLocation | null = null;
     let uFlowTexelLoc: WebGLUniformLocation | null = null;
     let uFlowMaxShiftLoc: WebGLUniformLocation | null = null;
@@ -1482,7 +1780,7 @@ export default function App() {
     let uFlowPyrLevelLoc: WebGLUniformLocation | null = null;
     let uFlowParentStepLoc: WebGLUniformLocation | null = null;
 
-    // Pass 2 (2D Elastic Mesh Warping + GPU Super-Resolution + HDR10) Uniform Locations
+    // Pass 2 (2D Elastic Mesh Warping + Secondary Sub-Frame Cascade + GPU Super-Resolution + HDR10) Uniform Locations
     let uAlphaLoc: WebGLUniformLocation | null = null;
     let uStrengthLoc: WebGLUniformLocation | null = null;
     let uMaxShiftLoc: WebGLUniformLocation | null = null;
@@ -1504,6 +1802,9 @@ export default function App() {
     let uUpscaleDenoiseLoc: WebGLUniformLocation | null = null;
     let uAdrenoOptLoc: WebGLUniformLocation | null = null;
     let uAdrenoTrue10Loc: WebGLUniformLocation | null = null;
+    let uFboPassLoc: WebGLUniformLocation | null = null;
+    let uSubframeCascadeLoc: WebGLUniformLocation | null = null;
+    let uCoherenceGuardLoc: WebGLUniformLocation | null = null;
 
     // Dirty-flag cache for static uniforms to eliminate redundant CPU->GPU driver calls on sub-frames
     const lastUniforms = {
@@ -1529,7 +1830,9 @@ export default function App() {
       upscaleSharp: -1,
       upscaleDenoise: -1,
       adrenoOpt: -1,
-      adrenoTrue10: -1
+      adrenoTrue10: -1,
+      subframeCascade: -1,
+      coherenceGuard: -1
     };
 
     if (stagingCtx) {
@@ -1539,7 +1842,11 @@ export default function App() {
       stagingCtx.fillRect(0, 0, STAGE_W, STAGE_H);
     }
 
-    if (gl) {
+    const initGlResources = () => {
+      if (!gl) return;
+      Object.keys(lastUniforms).forEach((k) => {
+        (lastUniforms as Record<string, number>)[k] = -1;
+      });
       try {
         // Detect Qualcomm Adreno GPU via WEBGL_debug_renderer_info
         const dbgRenderInfo = gl.getExtension('WEBGL_debug_renderer_info');
@@ -1602,8 +1909,7 @@ export default function App() {
           }
         `;
 
-        // Vertex Shader for Pass 2: 2D Subdivided Mesh (64x36 Grid = 4,608 Triangles)
-        // Zero shared uniforms with Fragment Shader to guarantee 100% WebGL 1.0 linker compatibility across all GPUs
+        // Vertex Shader for Pass 2: 2D Subdivided Mesh (supports both Screen Pass 2B and FBO Pass 2A)
         const vsSynthSource = `
           #ifdef GL_FRAGMENT_PRECISION_HIGH
             precision highp float;
@@ -1612,15 +1918,17 @@ export default function App() {
           #endif
           precision mediump int;
           attribute vec2 a_pos;
+          uniform int u_fboPass;
           varying vec2 v_uv;
           void main() {
-            v_uv = vec2((a_pos.x + 1.0) * 0.5, 1.0 - (a_pos.y + 1.0) * 0.5);
+            float uvY = (u_fboPass == 1) ? ((a_pos.y + 1.0) * 0.5) : (1.0 - (a_pos.y + 1.0) * 0.5);
+            v_uv = vec2((a_pos.x + 1.0) * 0.5, uvY);
             gl_Position = vec4(a_pos, 0.0, 1.0);
           }
         `;
 
-        // Pass 1 Fragment Shader: 3-Level Coarse-to-Fine Pyramid (L2: 16x9 -> L1: 32x18 -> L0: 64x36)
-        // + Symmetric Trajectory SAD + Sub-Pixel Lucas-Kanade + SAD Heatmap Debug Buffer Output
+        // Pass 1 Fragment Shader: 5-Level Coarse-to-Fine Pyramid (L4: 16x9 -> L3: 32x18 -> L2: 64x36 -> L1: 128x72 -> L0: up to 256x144)
+        // + Symmetric Trajectory Patch SAD + Census Structural Invariant + Sub-Pixel Lucas-Kanade + Fast SAD Heatmap Output
         const fsFlowSource = `
           #ifdef GL_FRAGMENT_PRECISION_HIGH
             precision highp float;
@@ -1645,7 +1953,6 @@ export default function App() {
             return dot(c, vec3(0.299, 0.587, 0.114));
           }
 
-          // Perceptual 5-stop scientific thermal colormap for Pass 1 Symmetric SAD error buffer output:
           mediump vec3 sadToThermalHeatmap(mediump float sadNorm) {
             mediump float t = clamp(sadNorm, 0.0, 1.0);
             mediump vec3 c0 = vec3(0.035, 0.094, 0.212);
@@ -1659,7 +1966,6 @@ export default function App() {
             return mix(c3, c4, (t - 0.75) * 4.0);
           }
 
-          // Multi-scale Symmetric Pivot 9-Point Patch SAD + Structural Gradient Conservation
           mediump float evalSymmetricSad(
             vec2 uv,
             vec2 dUV,
@@ -1668,38 +1974,44 @@ export default function App() {
             vec2 uv0 = clamp(uv - 0.5 * dUV, vec2(0.002), vec2(0.998));
             vec2 uv1 = clamp(uv + 0.5 * dUV, vec2(0.002), vec2(0.998));
 
-            mediump float c0C  = getLuma(texture2D(u_prevTex, uv0).rgb);
-            mediump float c0N  = getLuma(texture2D(u_prevTex, uv0 + vec2(0.0, -pStep.y)).rgb);
-            mediump float c0S  = getLuma(texture2D(u_prevTex, uv0 + vec2(0.0,  pStep.y)).rgb);
-            mediump float c0W  = getLuma(texture2D(u_prevTex, uv0 + vec2(-pStep.x, 0.0)).rgb);
-            mediump float c0E  = getLuma(texture2D(u_prevTex, uv0 + vec2( pStep.x, 0.0)).rgb);
-            mediump float c0NW = getLuma(texture2D(u_prevTex, uv0 + vec2(-pStep.x, -pStep.y) * 0.75).rgb);
-            mediump float c0SE = getLuma(texture2D(u_prevTex, uv0 + vec2( pStep.x,  pStep.y) * 0.75).rgb);
+            mediump float c0C = getLuma(texture2D(u_prevTex, uv0).rgb);
+            mediump float c0N = getLuma(texture2D(u_prevTex, uv0 + vec2(0.0, -pStep.y)).rgb);
+            mediump float c0S = getLuma(texture2D(u_prevTex, uv0 + vec2(0.0,  pStep.y)).rgb);
+            mediump float c0W = getLuma(texture2D(u_prevTex, uv0 + vec2(-pStep.x, 0.0)).rgb);
+            mediump float c0E = getLuma(texture2D(u_prevTex, uv0 + vec2( pStep.x, 0.0)).rgb);
 
-            mediump float c1C  = getLuma(texture2D(u_currTex, uv1).rgb);
-            mediump float c1N  = getLuma(texture2D(u_currTex, uv1 + vec2(0.0, -pStep.y)).rgb);
-            mediump float c1S  = getLuma(texture2D(u_currTex, uv1 + vec2(0.0,  pStep.y)).rgb);
-            mediump float c1W  = getLuma(texture2D(u_currTex, uv1 + vec2(-pStep.x, 0.0)).rgb);
-            mediump float c1E  = getLuma(texture2D(u_currTex, uv1 + vec2( pStep.x, 0.0)).rgb);
-            mediump float c1NW = getLuma(texture2D(u_currTex, uv1 + vec2(-pStep.x, -pStep.y) * 0.75).rgb);
-            mediump float c1SE = getLuma(texture2D(u_currTex, uv1 + vec2( pStep.x,  pStep.y) * 0.75).rgb);
+            mediump float c1C = getLuma(texture2D(u_currTex, uv1).rgb);
+            mediump float c1N = getLuma(texture2D(u_currTex, uv1 + vec2(0.0, -pStep.y)).rgb);
+            mediump float c1S = getLuma(texture2D(u_currTex, uv1 + vec2(0.0,  pStep.y)).rgb);
+            mediump float c1W = getLuma(texture2D(u_currTex, uv1 + vec2(-pStep.x, 0.0)).rgb);
+            mediump float c1E = getLuma(texture2D(u_currTex, uv1 + vec2( pStep.x, 0.0)).rgb);
 
             mediump float patchSad = abs(c1C - c0C) * 0.28 +
-              (abs(c1N - c0N) + abs(c1S - c0S) + abs(c1W - c0W) + abs(c1E - c0E)) * 0.13 +
-              (abs(c1NW - c0NW) + abs(c1SE - c0SE)) * 0.10;
+              (abs(c1N - c0N) + abs(c1S - c0S) + abs(c1W - c0W) + abs(c1E - c0E)) * 0.18;
 
             mediump float gx0 = c0E - c0W;
             mediump float gy0 = c0S - c0N;
             mediump float gx1 = c1E - c1W;
             mediump float gy1 = c1S - c1N;
-            mediump float gradDiff = (abs(gx1 - gx0) + abs(gy1 - gy0)) * 0.18;
+            mediump float gradDiff = (abs(gx1 - gx0) + abs(gy1 - gy0)) * 0.16;
 
-            return patchSad + gradDiff;
+            mediump float cenN = abs((c1N - c1C) - (c0N - c0C));
+            mediump float cenS = abs((c1S - c1C) - (c0S - c0C));
+            mediump float cenW = abs((c1W - c1C) - (c0W - c0C));
+            mediump float cenE = abs((c1E - c1C) - (c0E - c0C));
+            mediump float censusDiff = (cenN + cenS + cenW + cenE) * 0.065;
+
+            return patchSad + gradDiff + censusDiff;
           }
 
           void main() {
-            // Scale patch footprint according to Coarse-to-Fine pyramid level (L2=wide, L1=medium, L0=fine)
-            float levelScale = (u_pyrLevel == 2) ? 6.2 : (u_pyrLevel == 1) ? 3.6 : 2.1;
+            if (u_debugSad == 1) {
+              mediump float sadNorm = texture2D(u_lastFlowTex, v_uv).a;
+              gl_FragColor = vec4(sadToThermalHeatmap(sadNorm), sadNorm);
+              return;
+            }
+
+            float levelScale = (u_pyrLevel == 4) ? 9.0 : (u_pyrLevel == 3) ? 5.4 : (u_pyrLevel == 2) ? 3.2 : (u_pyrLevel == 1) ? 1.95 : 1.25;
             vec2 pStep = u_texelStep * levelScale;
             vec2 maxShift = max(u_flowMaxShift, vec2(0.001));
 
@@ -1715,15 +2027,24 @@ export default function App() {
             mediump float p1W = getLuma(texture2D(u_currTex, v_uv + vec2(-pStep.x, 0.0)).rgb);
             mediump float p1E = getLuma(texture2D(u_currTex, v_uv + vec2( pStep.x, 0.0)).rgb);
 
-            mediump float zeroSad = evalSymmetricSad(v_uv, vec2(0.0), pStep);
+            mediump float zeroPatchSad = abs(p1C - p0C) * 0.28 +
+              (abs(p1N - p0N) + abs(p1S - p0S) + abs(p1W - p0W) + abs(p1E - p0E)) * 0.18;
+            mediump float zeroGradDiff = (abs((p1E - p1W) - (p0E - p0W)) + abs((p1S - p1N) - (p0S - p0N))) * 0.16;
+            mediump float zeroCenDiff = (
+              abs((p1N - p1C) - (p0N - p0C)) +
+              abs((p1S - p1C) - (p0S - p0C)) +
+              abs((p1W - p1C) - (p0W - p0C)) +
+              abs((p1E - p1C) - (p0E - p0C))
+            ) * 0.065;
+            mediump float zeroSad = zeroPatchSad + zeroGradDiff + zeroCenDiff;
+
             mediump float e0 = abs(p0E - p0W) + abs(p0S - p0N) + abs(p0N + p0S + p0W + p0E - 4.0 * p0C);
             mediump float e1 = abs(p1E - p1W) + abs(p1S - p1N) + abs(p1N + p1S + p1W + p1E - 4.0 * p1C);
 
             mediump vec2 bestVel = vec2(0.0);
             mediump float bestSad = zeroSad;
 
-            // Read parent Coarse-to-Fine pyramid level (or temporal flow at L2) from u_lastFlowTex
-            vec2 parentStep = max(u_parentFlowStep, vec2(1.0 / 64.0, 1.0 / 36.0));
+            vec2 parentStep = max(u_parentFlowStep, vec2(1.0 / 512.0, 1.0 / 288.0));
             mediump vec2 parC = (texture2D(u_lastFlowTex, v_uv).rg - (128.0 / 255.0)) * 2.0;
             mediump vec2 parN = (texture2D(u_lastFlowTex, v_uv + vec2(0.0, -parentStep.y)).rg - (128.0 / 255.0)) * 2.0;
             mediump vec2 parS = (texture2D(u_lastFlowTex, v_uv + vec2(0.0,  parentStep.y)).rg - (128.0 / 255.0)) * 2.0;
@@ -1731,67 +2052,79 @@ export default function App() {
             mediump vec2 parE = (texture2D(u_lastFlowTex, v_uv + vec2( parentStep.x, 0.0)).rg - (128.0 / 255.0)) * 2.0;
 
             mediump vec2 pyramidMeanVel = parC * 0.40 + (parN + parS + parW + parE) * 0.15;
-
-            // Evaluate Coarse-to-Fine parent pyramid mean predictor
-            if (dot(pyramidMeanVel, pyramidMeanVel) > 0.0001) {
-              mediump float sadPyr = evalSymmetricSad(v_uv, pyramidMeanVel * maxShift, pStep);
-              if (sadPyr + 0.0018 < bestSad) {
-                bestSad = sadPyr;
-                bestVel = pyramidMeanVel;
-              }
-            }
-
-            // Evaluate parent center & 4 neighbor predictors
-            for (int p = 0; p < 5; p++) {
-              mediump vec2 candP = (p == 0) ? parC : (p == 1) ? parN : (p == 2) ? parS : (p == 3) ? parW : parE;
-              if (dot(candP, candP) > 0.0002) {
-                mediump float sadP = evalSymmetricSad(v_uv, candP * maxShift, pStep);
-                mediump float cohBias = length(candP - pyramidMeanVel) * 0.0035;
-                if (sadP + cohBias + 0.0018 < bestSad) {
-                  bestSad = sadP;
-                  bestVel = candP;
-                }
-              }
-            }
-
-            // At Level 0 (Fine level), also test temporal history predictor from u_temporalFlowTex
             mediump vec2 tempVel = parC;
-            if (u_pyrLevel == 0) {
-              tempVel = (texture2D(u_temporalFlowTex, v_uv).rg - (128.0 / 255.0)) * 2.0;
-              if (dot(tempVel, tempVel) > 0.0002) {
-                mediump float sadTemp = evalSymmetricSad(v_uv, tempVel * maxShift, pStep);
-                mediump float tempBias = length(tempVel - pyramidMeanVel) * 0.003;
-                if (sadTemp + tempBias + 0.002 < bestSad) {
-                  bestSad = sadTemp;
-                  bestVel = tempVel;
+            bool isStaticBlock = (zeroSad < 0.00035 && dot(pyramidMeanVel, pyramidMeanVel) < 0.00008);
+
+            if (!isStaticBlock) {
+              if (dot(pyramidMeanVel, pyramidMeanVel) > 0.00005) {
+                mediump float sadPyr = evalSymmetricSad(v_uv, pyramidMeanVel * maxShift, pStep);
+                if (sadPyr + 0.0008 < bestSad) {
+                  bestSad = sadPyr;
+                  bestVel = pyramidMeanVel;
                 }
               }
-            }
 
-            // Pyramid-scaled Diamond Refinement Search:
-            // L2 searches wide global motion; L1 refines medium contours; L0 refines fine local residuals
-            float rScale = (u_pyrLevel == 2) ? 1.0 : (u_pyrLevel == 1) ? 0.45 : 0.22;
+              for (int p = 0; p < 4; p++) {
+                mediump vec2 candP = (p == 0) ? parN : (p == 1) ? parS : (p == 2) ? parW : parE;
+                if (dot(candP - bestVel, candP - bestVel) > 0.0001) {
+                  mediump float sadP = evalSymmetricSad(v_uv, candP * maxShift, pStep);
+                  mediump float cohBias = length(candP - pyramidMeanVel) * 0.0018;
+                  if (sadP + cohBias + 0.0007 < bestSad) {
+                    bestSad = sadP;
+                    bestVel = candP;
+                  }
+                }
+              }
 
-            for (int s = 0; s < 3; s++) {
-              float r = ((s == 0) ? 0.48 : (s == 1) ? 0.22 : 0.09) * rScale;
-              mediump vec2 centerVel = bestVel;
+              if (u_pyrLevel <= 2) {
+                tempVel = (texture2D(u_temporalFlowTex, v_uv).rg - (128.0 / 255.0)) * 2.0;
+                if (dot(tempVel - bestVel, tempVel - bestVel) > 0.0001) {
+                  mediump float sadTemp = evalSymmetricSad(v_uv, tempVel * maxShift, pStep);
+                  mediump float tempBias = length(tempVel - pyramidMeanVel) * 0.0018;
+                  if (sadTemp + tempBias + 0.0008 < bestSad) {
+                    bestSad = sadTemp;
+                    bestVel = tempVel;
+                  }
+                }
+              }
+
+              float rScale = (u_pyrLevel == 4) ? 1.0 : (u_pyrLevel == 3) ? 0.54 : (u_pyrLevel == 2) ? 0.30 : (u_pyrLevel == 1) ? 0.16 : 0.085;
+              float r0 = 0.46 * rScale;
+              mediump vec2 centerVel0 = bestVel;
 
               for (int d = 0; d < 8; d++) {
                 vec2 offset = vec2(0.0);
-                if (d == 0) offset = vec2( r,  0.0);
-                else if (d == 1) offset = vec2(-r,  0.0);
-                else if (d == 2) offset = vec2( 0.0,  r);
-                else if (d == 3) offset = vec2( 0.0, -r);
-                else if (d == 4) offset = vec2( r * 0.707,  r * 0.707);
-                else if (d == 5) offset = vec2(-r * 0.707,  r * 0.707);
-                else if (d == 6) offset = vec2( r * 0.707, -r * 0.707);
-                else offset = vec2(-r * 0.707, -r * 0.707);
+                if (d == 0) offset = vec2( r0,  0.0);
+                else if (d == 1) offset = vec2(-r0,  0.0);
+                else if (d == 2) offset = vec2( 0.0,  r0);
+                else if (d == 3) offset = vec2( 0.0, -r0);
+                else if (d == 4) offset = vec2( r0 * 0.707,  r0 * 0.707);
+                else if (d == 5) offset = vec2(-r0 * 0.707,  r0 * 0.707);
+                else if (d == 6) offset = vec2( r0 * 0.707, -r0 * 0.707);
+                else offset = vec2(-r0 * 0.707, -r0 * 0.707);
 
-                mediump vec2 candVel = clamp(centerVel + offset, vec2(-0.96), vec2(0.96));
+                mediump vec2 candVel = clamp(centerVel0 + offset, vec2(-0.97), vec2(0.97));
                 mediump float candSad = evalSymmetricSad(v_uv, candVel * maxShift, pStep);
+                mediump float regBias = length(candVel) * 0.0008 + length(candVel - pyramidMeanVel) * 0.0032;
+                if (candSad + regBias < bestSad) {
+                  bestSad = candSad;
+                  bestVel = candVel;
+                }
+              }
 
-                // Pyramid spring regularization keeps fine vectors anchored to parent coarse trajectory
-                mediump float regBias = length(candVel) * 0.0020 + length(candVel - pyramidMeanVel) * 0.0065;
+              float r1 = 0.16 * rScale;
+              mediump vec2 centerVel1 = bestVel;
+              for (int d = 0; d < 4; d++) {
+                vec2 offset = (d == 0)
+                  ? vec2( r1, 0.0)
+                  : (d == 1)
+                  ? vec2(-r1, 0.0)
+                  : (d == 2)
+                  ? vec2(0.0,  r1)
+                  : vec2(0.0, -r1);
+                mediump vec2 candVel = clamp(centerVel1 + offset, vec2(-0.98), vec2(0.98));
+                mediump float candSad = evalSymmetricSad(v_uv, candVel * maxShift, pStep);
+                mediump float regBias = length(candVel) * 0.0008 + length(candVel - pyramidMeanVel) * 0.0032;
                 if (candSad + regBias < bestSad) {
                   bestSad = candSad;
                   bestVel = candVel;
@@ -1799,9 +2132,8 @@ export default function App() {
               }
             }
 
-            // Sub-Pixel Symmetric Lucas-Kanade Gradient Step on Level 1 and Level 0
-            if (u_pyrLevel <= 1) {
-              vec2 lkStep = u_texelStep * ((u_pyrLevel == 1) ? 2.4 : 1.4);
+            if (!isStaticBlock && u_pyrLevel <= 3) {
+              vec2 lkStep = u_texelStep * ((u_pyrLevel == 3) ? 4.0 : (u_pyrLevel == 2) ? 2.5 : (u_pyrLevel == 1) ? 1.6 : 1.05);
               vec2 uv0 = clamp(v_uv - 0.5 * bestVel * maxShift, vec2(0.003), vec2(0.997));
               vec2 uv1 = clamp(v_uv + 0.5 * bestVel * maxShift, vec2(0.003), vec2(0.997));
 
@@ -1821,8 +2153,8 @@ export default function App() {
               mediump float iy = 0.25 * ((m1S - m1N) + (m0S - m0N));
               mediump float it = m1C - m0C;
               mediump float gradMagSq = ix * ix + iy * iy;
-              if (gradMagSq > 0.0004) {
-                mediump float reg = (u_adrenoOpt == 1) ? 0.0045 : 0.0035;
+              if (gradMagSq > 0.00025) {
+                mediump float reg = (u_adrenoOpt == 1) ? 0.0035 : 0.0025;
                 vec2 deltaPixels = -it * vec2(ix, iy) / (gradMagSq + reg);
                 deltaPixels = clamp(deltaPixels, vec2(-1.0), vec2(1.0));
                 vec2 deltaVel = (deltaPixels * lkStep) / maxShift;
@@ -1835,34 +2167,29 @@ export default function App() {
               }
             }
 
-            // Static background & noise gate: preserve 100% full vector amplitude on all moving objects
-            mediump float structureGate = smoothstep(0.0012, 0.012, max(e0, e1));
-            mediump float changeGate = smoothstep(0.0010, 0.009, zeroSad);
-            mediump float improvementGate = smoothstep(0.99, 0.78, bestSad / max(zeroSad, 0.0004));
-            mediump float activityWeight = structureGate * changeGate * mix(0.88, 1.0, improvementGate);
+            // Responsive motion activity gate: preserves full motion vector amplitude on moving content while gating pure static noise
+            mediump float structureGate = smoothstep(0.0004, 0.006, max(e0, e1));
+            mediump float changeGate = smoothstep(0.0003, 0.0045, zeroSad);
+            mediump float improvementGate = smoothstep(1.02, 0.82, bestSad / max(zeroSad, 0.0003));
+            mediump float activityWeight = structureGate * changeGate * mix(0.92, 1.0, improvementGate);
 
-            mediump float matchConf = smoothstep(0.36, 0.025, bestSad);
-            mediump float cutGuard = (u_sceneCutProtect == 1) ? smoothstep(0.55, 0.25, bestSad) : 1.0;
+            mediump float matchConf = smoothstep(0.42, 0.018, bestSad);
+            mediump float cutGuard = (u_sceneCutProtect == 1) ? smoothstep(0.56, 0.26, bestSad) : 1.0;
             mediump float finalConf = clamp(matchConf * cutGuard, 0.0, 1.0);
 
-            // Normalized Symmetric SAD residual [0..1]
             mediump float sadErrorNorm = clamp(bestSad * 4.2, 0.0, 1.0);
-
-            if (u_debugSad == 1 && u_pyrLevel == 0) {
-              mediump vec3 heatRGB = sadToThermalHeatmap(sadErrorNorm);
-              gl_FragColor = vec4(heatRGB, sadErrorNorm);
-              return;
-            }
 
             mediump vec2 rawVel = bestVel * activityWeight * cutGuard;
 
-            // Spatial-Temporal Pyramid Coherence Filter with fast response for full 60/120 FPS displacement
             mediump vec2 refCoherent = (u_pyrLevel == 0)
-              ? mix(pyramidMeanVel, tempVel, 0.28) * cutGuard
+              ? mix(pyramidMeanVel, tempVel, 0.22) * cutGuard
               : pyramidMeanVel * cutGuard;
             mediump float velDiff = length(rawVel - refCoherent);
+            mediump float edgeDiscontinuity = smoothstep(0.12, 0.40, velDiff) * finalConf;
             mediump float cohAgree = smoothstep(0.42, 0.04, velDiff);
-            mediump float blendWeight = (u_pyrLevel == 2) ? 0.90 : mix(0.76, 0.94, cohAgree);
+            mediump float blendWeight = (u_pyrLevel == 4)
+              ? 0.94
+              : mix(mix(0.80, 0.96, cohAgree), 0.97, edgeDiscontinuity);
             mediump vec2 finalVel = clamp(mix(refCoherent, rawVel, blendWeight), vec2(-0.98), vec2(0.98));
 
             mediump vec2 encodedRG = clamp(finalVel * 0.5 + (128.0 / 255.0), 0.0, 1.0);
@@ -1870,7 +2197,7 @@ export default function App() {
           }
         `;
 
-        // Pass 2 Fragment Shader: 2D Elastic Mesh Synthesis + 9-Tap Anti-Ringing GPU Upscaler + 10-Bit HDR10
+        // Pass 2 Fragment Shader: 2D Elastic Mesh Synthesis + Hierarchical Secondary Sub-Frame Cascade + 9-Tap GPU Upscaler + 10-Bit HDR10
         const fsSynthSource = `
           #ifdef GL_FRAGMENT_PRECISION_HIGH
             precision highp float;
@@ -1883,6 +2210,7 @@ export default function App() {
           uniform sampler2D u_currTex;
           uniform sampler2D u_flowTex;
           uniform sampler2D u_sadDebugTex;
+          uniform sampler2D u_subframeMidTex;
           uniform float u_alpha;
           uniform float u_strength;
           uniform float u_maxShift;
@@ -1904,6 +2232,9 @@ export default function App() {
           uniform float u_upscaleDenoise;
           uniform int u_adrenoOpt;
           uniform int u_adrenoTrue10;
+          uniform int u_fboPass;
+          uniform int u_subframeCascade;
+          uniform float u_coherenceGuard;
 
           mediump float getLuma(mediump vec3 c) {
             return dot(c, vec3(0.299, 0.587, 0.114));
@@ -1914,7 +2245,7 @@ export default function App() {
             return w * w * (2.2 * w - 1.2);
           }
 
-          // Honest 9-Tap Anti-Ringing GPU Super-Resolution Upscaler (1.5x / 2.0x / 4.0x 4K UHD)
+          // Honest 9-Tap Anti-Ringing GPU Super-Resolution Upscaler (1.5x FHD+ / 2.0x QHD 2K / 4.0x 4K UHD)
           // Modes: 1 = AMD FSR 1.0 RCAS, 2 = Anime4K Line Reconstruction, 3 = Cinema Lanczos-4, 4 = Qualcomm Snapdragon GSR
           mediump vec3 applyGpuUpscaler(
             mediump vec3 baseColor,
@@ -1929,7 +2260,6 @@ export default function App() {
             float factorNorm = clamp((upFactor - 1.5) / 2.5, 0.0, 1.0);
             vec2 texel = u_sourceTexel * mix(0.90, 0.62, factorNorm);
 
-            // 9-tap neighborhood sampling (cardinal + diagonal) for alias-free diagonal edge reconstruction
             mediump vec3 cN  = texture2D(u_currTex, clamp(uvCurrCoord + vec2(0.0, -texel.y), vec2(0.001), vec2(0.999))).rgb;
             mediump vec3 cS  = texture2D(u_currTex, clamp(uvCurrCoord + vec2(0.0,  texel.y), vec2(0.001), vec2(0.999))).rgb;
             mediump vec3 cW  = texture2D(u_currTex, clamp(uvCurrCoord + vec2(-texel.x, 0.0), vec2(0.001), vec2(0.999))).rgb;
@@ -1954,7 +2284,6 @@ export default function App() {
             mediump vec3 avg8     = avgCross * 0.68 + avgDiag * 0.32;
             mediump vec3 zeroDcDetail = (refCurrColor - avg8) * occDamp;
 
-            // Strict 9-Tap Neighborhood Anti-Ringing Clamp (prevents white/black overshoot halos on text & edges)
             mediump vec3 minCard = min(min(cN, cS), min(cW, cE));
             mediump vec3 maxCard = max(max(cN, cS), max(cW, cE));
             mediump vec3 minDiag = min(min(cNW, cSE), min(cNE, cSW));
@@ -1965,7 +2294,6 @@ export default function App() {
             mediump vec3 minBound = clamp(baseColor - span * 0.65, 0.0, 1.0);
             mediump vec3 maxBound = clamp(baseColor + span * 0.65, 0.0, 1.0);
 
-            // Edge-preserving bilateral de-blocking & mosquito noise filter in flat areas
             mediump float gradMag = abs(lN - lS) + abs(lE - lW) + 0.5 * (abs(lNW - lSE) + abs(lNE - lSW));
             mediump float flatMask = (1.0 - smoothstep(0.014, 0.085, gradMag)) * clamp(denoise, 0.0, 1.0);
             mediump vec3 cleanBase = clamp(mix(baseColor, mix(baseColor, avg8, 0.42), flatMask), 0.0, 1.0);
@@ -2023,7 +2351,6 @@ export default function App() {
             mediump vec3 hdrLin = lin * mix(0.85, specPeak, shadowToe);
             mediump float hdrLuma = dot(hdrLin, vec3(0.2126, 0.7152, 0.0722));
 
-            // Natural Vibrance & Rec.2020 Gamut Expansion (boosts muted colors more than already saturated colors)
             mediump float maxC = max(hdrLin.r, max(hdrLin.g, hdrLin.b));
             mediump float minC = min(hdrLin.r, min(hdrLin.g, hdrLin.b));
             mediump float sat = (maxC - minC) / max(maxC, 0.001);
@@ -2038,7 +2365,6 @@ export default function App() {
 
             mediump vec3 res = mix(color, mapped, clamp(intensity, 0.0, 1.5));
 
-            // Triangular-PDF Interleaved Gradient Noise Anti-Banding Dither (eliminates 8-bit sky/shadow banding)
             float ign1 = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
             float ign2 = fract(52.9829189 * fract(dot(gl_FragCoord.xy + vec2(17.0, 31.0), vec2(0.06711056, 0.00583715))));
             float tpdf = (ign1 + ign2) - 1.0;
@@ -2054,13 +2380,13 @@ export default function App() {
           }
 
           void main() {
-            vec2 mappedUV = (v_uv - 0.5) * u_uvScale + 0.5;
+            vec2 mappedUV = (u_fboPass == 1) ? v_uv : ((v_uv - 0.5) * u_uvScale + 0.5);
             if (mappedUV.x < 0.0 || mappedUV.x > 1.0 || mappedUV.y < 0.0 || mappedUV.y > 1.0) {
               gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
               return;
             }
 
-            bool isOriginalSide = (u_splitCompare == 1 && v_uv.x < 0.5);
+            bool isOriginalSide = (u_fboPass == 0 && u_splitCompare == 1 && v_uv.x < 0.5);
             mediump float occBias = 0.0;
             mediump vec3 outColor;
             mediump vec3 upscalerRefCurr;
@@ -2081,7 +2407,7 @@ export default function App() {
               outColor = mix(pCol, cCol, u_alpha);
               upscalerRefCurr = cCol;
             } else {
-              // Mode 2: Full-Amplitude 60/120 FPS Optical Flow MEMC (3-Level Pyramid + Continuous 2D Mesh Warping)
+              // Mode 2: 5-Level Pyramid Optical Flow MEMC + Secondary Sub-Frame Cascade FBO
               vec2 flowStep = u_flowStep;
               mediump vec4 flowC  = texture2D(u_flowTex, mappedUV);
               mediump vec4 flowN  = texture2D(u_flowTex, mappedUV + vec2(0.0, -flowStep.y));
@@ -2103,33 +2429,37 @@ export default function App() {
               mediump vec2 vSW = (flowSW.rg - (128.0 / 255.0)) * 2.0;
               mediump vec2 vSE = (flowSE.rg - (128.0 / 255.0)) * 2.0;
 
-              // Elastic Spring-Mass Laplacian Regularization across hardware-interpolated 64x36 flow grid
+              mediump vec3 unwarpedPrev = texture2D(u_prevTex, mappedUV).rgb;
+              mediump vec3 unwarpedCurr = texture2D(u_currTex, mappedUV).rgb;
+
               mediump vec2 laplacianMean = (vN + vS + vW + vE) * 0.16 + (vNW + vNE + vSW + vSE) * 0.09;
-              mediump vec2 baseMean = vC * 0.36 + laplacianMean * 0.64;
+              mediump vec2 baseMean = vC * 0.44 + laplacianMean * 0.56;
 
-              mediump float wC = (0.30 + flowC.b) * 1.40 / (1.0 + dot(vC - baseMean, vC - baseMean) * 16.0);
-              mediump float wN = (0.25 + flowN.b) * 0.95 / (1.0 + dot(vN - baseMean, vN - baseMean) * 16.0);
-              mediump float wS = (0.25 + flowS.b) * 0.95 / (1.0 + dot(vS - baseMean, vS - baseMean) * 16.0);
-              mediump float wW = (0.25 + flowW.b) * 0.95 / (1.0 + dot(vW - baseMean, vW - baseMean) * 16.0);
-              mediump float wE = (0.25 + flowE.b) * 0.95 / (1.0 + dot(vE - baseMean, vE - baseMean) * 16.0);
+              mediump float qC = (0.35 + flowC.b) * (1.15 - 0.65 * flowC.a);
+              mediump float qN = (0.28 + flowN.b) * (1.15 - 0.65 * flowN.a);
+              mediump float qS = (0.28 + flowS.b) * (1.15 - 0.65 * flowS.a);
+              mediump float qW = (0.28 + flowW.b) * (1.15 - 0.65 * flowW.a);
+              mediump float qE = (0.28 + flowE.b) * (1.15 - 0.65 * flowE.a);
+
+              mediump float wC = qC * 1.55 / (1.0 + dot(vC - baseMean, vC - baseMean) * 14.0);
+              mediump float wN = qN / (1.0 + dot(vN - baseMean, vN - baseMean) * 14.0);
+              mediump float wS = qS / (1.0 + dot(vS - baseMean, vS - baseMean) * 14.0);
+              mediump float wW = qW / (1.0 + dot(vW - baseMean, vW - baseMean) * 14.0);
+              mediump float wE = qE / (1.0 + dot(vE - baseMean, vE - baseMean) * 14.0);
               mediump float wSum = max(wC + wN + wS + wW + wE, 0.0001);
-              mediump vec2 robustNodeVel = (vC * wC + vN * wN + vS * wS + vW * wW + vE * wE) / wSum;
-              mediump vec2 maxStrain = vec2(0.58);
-              mediump vec2 baseVel = clamp(robustNodeVel, laplacianMean - maxStrain, laplacianMean + maxStrain);
+              mediump vec2 baseVel = (vC * wC + vN * wN + vS * wS + vW * wW + vE * wE) / wSum;
 
-              // Foreground Dominant Motion Predictor so fast-moving object contours shift at 100% speed
-              mediump float mC = (0.03 + sqrt(dot(vC, vC))) * (0.35 + flowC.b) * 1.25;
-              mediump float mN = (0.03 + sqrt(dot(vN, vN))) * (0.35 + flowN.b);
-              mediump float mS = (0.03 + sqrt(dot(vS, vS))) * (0.35 + flowS.b);
-              mediump float mW = (0.03 + sqrt(dot(vW, vW))) * (0.35 + flowW.b);
-              mediump float mE = (0.03 + sqrt(dot(vE, vE))) * (0.35 + flowE.b);
+              mediump float mC = (0.025 + sqrt(dot(vC, vC))) * qC * 1.35;
+              mediump float mN = (0.025 + sqrt(dot(vN, vN))) * qN;
+              mediump float mS = (0.025 + sqrt(dot(vS, vS))) * qS;
+              mediump float mW = (0.025 + sqrt(dot(vW, vW))) * qW;
+              mediump float mE = (0.025 + sqrt(dot(vE, vE))) * qE;
               mediump float mSum = max(mC + mN + mS + mW + mE, 0.0001);
               mediump vec2 peakVel = (vC * mC + vN * mN + vS * mS + vW * mW + vE * mE) / mSum;
 
               float sourceAspect = u_sourceTexel.y > 0.0 ? (u_sourceTexel.y / max(u_sourceTexel.x, 0.00001)) : (16.0 / 9.0);
               vec2 shiftScaleUV = vec2(u_maxShift, u_maxShift * clamp(sourceAspect, 0.5, 2.4)) * u_strength;
 
-              // Full bidirectional trajectory warp for baseVel and peakVel
               vec2 shiftBaseUV = baseVel * shiftScaleUV;
               vec2 uvPrevBase = clamp(mappedUV - u_alpha * shiftBaseUV, vec2(0.001), vec2(0.999));
               vec2 uvCurrBase = clamp(mappedUV + (1.0 - u_alpha) * shiftBaseUV, vec2(0.001), vec2(0.999));
@@ -2144,36 +2474,114 @@ export default function App() {
               mediump vec3 wCurrPeak = texture2D(u_currTex, uvCurrPeak).rgb;
               mediump float errPeak = length(wPrevPeak - wCurrPeak);
 
-              mediump float usePeak = smoothstep(0.005, 0.045, errBase - errPeak);
+              mediump float usePeak = smoothstep(0.004, 0.036, errBase - errPeak);
               mediump vec3 warpedPrev = mix(wPrevBase, wPrevPeak, usePeak);
               mediump vec3 warpedCurr = mix(wCurrBase, wCurrPeak, usePeak);
               vec2 uvCurr = mix(uvCurrBase, uvCurrPeak, usePeak);
+              vec2 chosenShiftUV = mix(shiftBaseUV, shiftPeakUV, usePeak);
               mediump float warpErr = mix(errBase, errPeak, usePeak);
 
-              mediump vec3 unwarpedPrev = texture2D(u_prevTex, mappedUV).rgb;
-              mediump vec3 unwarpedCurr = texture2D(u_currTex, mappedUV).rgb;
-
-              // Asymmetric Occlusion Resolution at object boundaries (chooses clean uncovered background/foreground)
+              mediump float flowDiv = (vE.x - vW.x) + (vS.y - vN.y);
+              mediump float velShear = length(vE - vW) + length(vS - vN);
               mediump float dPrev = length(warpedPrev - unwarpedCurr);
               mediump float dCurr = length(warpedCurr - unwarpedPrev);
-              mediump float occEdgeGate = smoothstep(0.03, 0.15, warpErr);
-              mediump float sideBias = clamp((dPrev - dCurr) * 1.55, -0.44, 0.44) * occEdgeGate;
-              mediump float forwardWeight = clamp(u_alpha + sideBias * (0.35 + 0.55 * u_haloGuard), 0.0, 1.0);
-              mediump vec3 warpedOut = mix(warpedPrev, warpedCurr, forwardWeight);
+              mediump float occBoundary = smoothstep(0.024, 0.14, warpErr) * smoothstep(0.035, 0.22, velShear + abs(flowDiv));
+              mediump float dirSelect = clamp((dPrev - dCurr) * 2.4 + flowDiv * 0.85, -0.85, 0.85) * occBoundary;
+              mediump float forwardWeight = clamp(u_alpha + dirSelect * (0.45 + 0.55 * u_haloGuard), 0.0, 1.0);
+              mediump vec3 primaryWarped = mix(warpedPrev, warpedCurr, forwardWeight);
 
-              // Minimal Anti-Halo Guard: preserves 100% warped motion unless extreme occlusion mismatch occurs
-              mediump float occThresh = mix(0.85, 0.28, clamp(u_haloGuard, 0.0, 1.0));
-              occBias = smoothstep(0.10, occThresh, warpErr * warpErr) * (0.32 * u_haloGuard);
-              mediump float haloBlend = clamp(occBias, 0.0, 0.35 * u_haloGuard);
+              mediump float staticDiff = length(unwarpedCurr - unwarpedPrev);
+              mediump float stationaryAdvantage = smoothstep(0.028, 0.11, warpErr - staticDiff * 1.45);
+              mediump float staticGuardMask =
+                (1.0 - smoothstep(0.004, 0.018, staticDiff)) *
+                stationaryAdvantage *
+                clamp(0.35 + 0.55 * u_haloGuard, 0.0, 0.85);
 
-              mediump vec3 smoothTemporalBlend = mix(unwarpedPrev, unwarpedCurr, u_alpha);
-              outColor = mix(warpedOut, smoothTemporalBlend, haloBlend);
-              upscalerRefCurr = mix(warpedCurr, unwarpedCurr, haloBlend * 0.25);
-              upscalerUvCurr = mix(uvCurr, mappedUV, haloBlend * 0.25);
-              occBias = haloBlend;
+              mediump float extremeMismatch = smoothstep(
+                mix(0.95, 0.48, clamp(u_haloGuard, 0.0, 1.0)),
+                1.18,
+                warpErr * (1.0 - 0.65 * occBoundary)
+              ) * (0.18 * u_haloGuard);
+              mediump float preserveUnwarped = clamp(max(staticGuardMask, extremeMismatch), 0.0, 0.88);
+
+              mediump vec3 cleanStaticRef = mix(unwarpedPrev, unwarpedCurr, u_alpha);
+              mediump vec3 primaryOut = mix(primaryWarped, cleanStaticRef, preserveUnwarped);
+
+              // Hierarchical Secondary Sub-Frame Cascade (Pass 2B):
+              // Synthesizes "intermediate-from-intermediate" sub-frames using glSubframeMidFbo (I_0.5)
+              // with half-distance trajectory warping (0.5 * shiftUV) and Vector Coherence Gate
+              if (u_fboPass == 0 && u_subframeCascade > 0) {
+                vec2 halfShiftUV = chosenShiftUV * 0.5;
+                mediump vec3 cascadeColor;
+                mediump float subErr;
+
+                if (u_alpha <= 0.5) {
+                  // Sub-interval [0.0, 0.5]: warp between Keyframe T-1 (u_prevTex) and Synthesized Anchor I_0.5 (u_subframeMidTex)
+                  mediump float beta = clamp(u_alpha * 2.0, 0.0, 1.0);
+                  vec2 uvSubPrev = clamp(mappedUV - beta * halfShiftUV, vec2(0.001), vec2(0.999));
+                  vec2 uvSubMid  = clamp(mappedUV + (1.0 - beta) * halfShiftUV, vec2(0.001), vec2(0.999));
+                  mediump vec3 cSubPrev = texture2D(u_prevTex, uvSubPrev).rgb;
+                  mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
+                  subErr = length(cSubPrev - cSubMid);
+                  mediump float subWeight = clamp(beta + dirSelect * 0.28, 0.0, 1.0);
+                  cascadeColor = mix(cSubPrev, cSubMid, subWeight);
+
+                  if (u_subframeCascade >= 3) {
+                    // 3x / 4x Multi-Tap Trajectory Stabilization along the [T-1 -> I_0.5] sub-vector
+                    vec2 uvSubQ = clamp(mappedUV + (0.5 - beta) * halfShiftUV * 0.5, vec2(0.001), vec2(0.999));
+                    mediump vec3 cSubQ = mix(cSubPrev, texture2D(u_subframeMidTex, uvSubQ).rgb, clamp(beta * 1.15, 0.0, 1.0));
+                    cascadeColor = mix(cascadeColor, cSubQ, (u_subframeCascade == 4) ? 0.30 : 0.18);
+                  }
+                } else {
+                  // Sub-interval [0.5, 1.0]: warp between Synthesized Anchor I_0.5 (u_subframeMidTex) and Keyframe T (u_currTex)
+                  mediump float beta = clamp((u_alpha - 0.5) * 2.0, 0.0, 1.0);
+                  vec2 uvSubMid  = clamp(mappedUV - beta * halfShiftUV, vec2(0.001), vec2(0.999));
+                  vec2 uvSubCurr = clamp(mappedUV + (1.0 - beta) * halfShiftUV, vec2(0.001), vec2(0.999));
+                  mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
+                  mediump vec3 cSubCurr = texture2D(u_currTex, uvSubCurr).rgb;
+                  subErr = length(cSubMid - cSubCurr);
+                  mediump float subWeight = clamp(beta + dirSelect * 0.28, 0.0, 1.0);
+                  cascadeColor = mix(cSubMid, cSubCurr, subWeight);
+
+                  if (u_subframeCascade >= 3) {
+                    // 3x / 4x Multi-Tap Trajectory Stabilization along the [I_0.5 -> T] sub-vector
+                    vec2 uvSubQ = clamp(mappedUV - (beta - 0.5) * halfShiftUV * 0.5, vec2(0.001), vec2(0.999));
+                    mediump vec3 cSubQ = mix(texture2D(u_subframeMidTex, uvSubQ).rgb, cSubCurr, clamp(beta * 0.88, 0.0, 1.0));
+                    cascadeColor = mix(cascadeColor, cSubQ, (u_subframeCascade == 4) ? 0.30 : 0.18);
+                  }
+                }
+
+                // Vector Coherence & Fast-Scene Anti-Ghosting Gate:
+                // Evaluates spatial velocity shear, divergence, Pass 1 SAD confidence, and sub-warp agreement
+                mediump float cohShear = velShear + abs(flowDiv) * 0.85;
+                mediump float shearCutoff = mix(0.46, 0.14, clamp(u_coherenceGuard, 0.0, 1.0));
+                mediump float errCutoff   = mix(0.36, 0.11, clamp(u_coherenceGuard, 0.0, 1.0));
+                mediump float spatialCoherence = 1.0 - smoothstep(0.025, shearCutoff, cohShear);
+                mediump float subWarpAgreement = 1.0 - smoothstep(0.020, errCutoff, subErr);
+                mediump float sadConfidence = clamp(flowC.b * (1.12 - 0.55 * flowC.a), 0.0, 1.0);
+
+                mediump float cascadeDepth = (u_subframeCascade == 4) ? 0.92 : (u_subframeCascade == 3) ? 0.84 : 0.75;
+                mediump float cascadeBlend =
+                  cascadeDepth *
+                  mix(1.0, spatialCoherence * subWarpAgreement * (0.45 + 0.55 * sadConfidence), clamp(u_coherenceGuard * 0.90, 0.15, 0.95)) *
+                  (1.0 - preserveUnwarped);
+
+                outColor = mix(primaryOut, cascadeColor, clamp(cascadeBlend, 0.0, 0.94));
+              } else {
+                outColor = primaryOut;
+              }
+
+              upscalerRefCurr = mix(warpedCurr, unwarpedCurr, preserveUnwarped * 0.5);
+              upscalerUvCurr = mix(uvCurr, mappedUV, preserveUnwarped * 0.5);
+              occBias = preserveUnwarped;
             }
 
-            // Apply Honest 9-Tap Anti-Ringing GPU Super-Resolution Upscaler (Snapdragon GSR / FSR / Anime4K / Cinema)
+            // Pass 2A Anchor FBO output: write clean stabilized intermediate frame I_0.5 directly to glSubframeMidFbo
+            if (u_fboPass == 1) {
+              gl_FragColor = vec4(clamp(outColor, 0.0, 1.0), 1.0);
+              return;
+            }
+
             if (u_upscaleMode > 0 && !isOriginalSide) {
               outColor = applyGpuUpscaler(
                 outColor,
@@ -2183,7 +2591,7 @@ export default function App() {
                 u_upscaleFactor,
                 u_upscaleSharpness,
                 u_upscaleDenoise,
-                1.0 - occBias * 0.5
+                1.0 - occBias * 0.35
               );
             }
 
@@ -2198,7 +2606,6 @@ export default function App() {
               outColor = vec3(gray);
             }
 
-            // Pass 1 Symmetric SAD Error Heatmap Buffer Visualization
             if (u_showSadHeatmap == 1 && !isOriginalSide) {
               mediump vec4 sadBuf = texture2D(u_sadDebugTex, mappedUV);
               mediump float sadVal = sadBuf.a;
@@ -2211,13 +2618,11 @@ export default function App() {
               outColor = heatComposite;
             }
 
-            // GPU Shader Motion Vectors & Elastic Mesh Overlay
             if (u_showVectors == 1 && u_mode != 0) {
-              vec2 gridSize = vec2(20.0, 11.0);
+              vec2 gridSize = vec2(24.0, 13.5);
               vec2 cellCenterUV = (floor(mappedUV * gridSize) + 0.5) / gridSize;
               vec2 cellLocal = fract(mappedUV * gridSize) - 0.5;
               mediump vec2 cellVel = (texture2D(u_flowTex, cellCenterUV).rg - (128.0 / 255.0)) * 2.0;
-              // Draw subtle deformed elastic mesh wireframe + motion vector arrows
               vec2 warpedGridLocal = abs(fract((mappedUV - cellVel * 0.018) * gridSize) - 0.5);
               if (max(warpedGridLocal.x, warpedGridLocal.y) > 0.472) {
                 outColor = mix(outColor, vec3(0.22, 0.78, 0.98), 0.28);
@@ -2260,6 +2665,8 @@ export default function App() {
           const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
           const prog = gl.createProgram();
           if (!vs || !fs || !prog) {
+            if (vs) gl.deleteShader(vs);
+            if (fs) gl.deleteShader(fs);
             if (prog) gl.deleteProgram(prog);
             return null;
           }
@@ -2267,6 +2674,8 @@ export default function App() {
           gl.attachShader(prog, fs);
           gl.bindAttribLocation(prog, 0, 'a_pos');
           gl.linkProgram(prog);
+          gl.deleteShader(vs);
+          gl.deleteShader(fs);
           if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
             const err = gl.getProgramInfoLog(prog);
             console.warn('WebGL Program link error:', err);
@@ -2380,9 +2789,20 @@ export default function App() {
             return { tex, fbo };
           };
 
-          // Allocate 3-Level Coarse-to-Fine Pyramid FBOs (L2: 16x9, L1: 32x18, L0: 64x36)
+          // Allocate 5-Level Coarse-to-Fine Pyramid FBOs (L4: 16x9, L3: 32x18, L2: 64x36, L1: 128x72, L0: Adaptive up to 256x144)
+          allocatedFlowCols = FLOW_COLS;
+          allocatedFlowRows = FLOW_ROWS;
+          allocatedTexW = STAGE_W;
+          allocatedTexH = STAGE_H;
+
+          const pyrL4 = createFlowFboPair(PYR_L4_COLS, PYR_L4_ROWS, makeNeutralFlow(PYR_L4_COLS, PYR_L4_ROWS));
+          const pyrL3 = createFlowFboPair(PYR_L3_COLS, PYR_L3_ROWS, makeNeutralFlow(PYR_L3_COLS, PYR_L3_ROWS));
           const pyrL2 = createFlowFboPair(PYR_L2_COLS, PYR_L2_ROWS, makeNeutralFlow(PYR_L2_COLS, PYR_L2_ROWS));
           const pyrL1 = createFlowFboPair(PYR_L1_COLS, PYR_L1_ROWS, makeNeutralFlow(PYR_L1_COLS, PYR_L1_ROWS));
+          glPyrL4Tex = pyrL4.tex;
+          glPyrL4Fbo = pyrL4.fbo;
+          glPyrL3Tex = pyrL3.tex;
+          glPyrL3Fbo = pyrL3.fbo;
           glPyrL2Tex = pyrL2.tex;
           glPyrL2Fbo = pyrL2.fbo;
           glPyrL1Tex = pyrL1.tex;
@@ -2398,6 +2818,15 @@ export default function App() {
           glFlowFboCurr = pairB.fbo;
           glSadDebugTex = pairSad.tex;
           glSadDebugFbo = pairSad.fbo;
+
+          // Allocate Pass 2A Secondary Sub-Frame Anchor FBO (glSubframeMidFbo for I_0.5 intermediate keyframe)
+          allocatedSubframeW = STAGE_W;
+          allocatedSubframeH = STAGE_H;
+          glSubframeMidTex = createLinearTex();
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, STAGE_W, STAGE_H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+          glSubframeMidFbo = gl.createFramebuffer();
+          gl.bindFramebuffer(gl.FRAMEBUFFER, glSubframeMidFbo);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, glSubframeMidTex, 0);
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
           // Configure Pass 1 (flowProg) uniforms
@@ -2427,6 +2856,7 @@ export default function App() {
           gl.uniform1i(gl.getUniformLocation(synthProg, 'u_currTex'), 1);
           gl.uniform1i(gl.getUniformLocation(synthProg, 'u_flowTex'), 2);
           gl.uniform1i(gl.getUniformLocation(synthProg, 'u_sadDebugTex'), 3);
+          gl.uniform1i(gl.getUniformLocation(synthProg, 'u_subframeMidTex'), 4);
 
           uAlphaLoc = gl.getUniformLocation(synthProg, 'u_alpha');
           uStrengthLoc = gl.getUniformLocation(synthProg, 'u_strength');
@@ -2449,9 +2879,19 @@ export default function App() {
           uUpscaleDenoiseLoc = gl.getUniformLocation(synthProg, 'u_upscaleDenoise');
           uAdrenoOptLoc = gl.getUniformLocation(synthProg, 'u_adrenoOpt');
           uAdrenoTrue10Loc = gl.getUniformLocation(synthProg, 'u_adrenoTrue10');
+          uFboPassLoc = gl.getUniformLocation(synthProg, 'u_fboPass');
+          uSubframeCascadeLoc = gl.getUniformLocation(synthProg, 'u_subframeCascade');
+          uCoherenceGuardLoc = gl.getUniformLocation(synthProg, 'u_coherenceGuard');
 
           gl.uniform2f(uSourceTexelLoc, 1.0 / STAGE_W, 1.0 / STAGE_H);
           gl.uniform2f(uFlowStepLoc, 1.0 / FLOW_COLS, 1.0 / FLOW_ROWS);
+          if (uFboPassLoc) gl.uniform1i(uFboPassLoc, 0);
+          if (uSubframeCascadeLoc) gl.uniform1i(uSubframeCascadeLoc, 2);
+          if (uCoherenceGuardLoc) gl.uniform1f(uCoherenceGuardLoc, 0.75);
+
+          // Ensure Pass 1 texture unit 3 is bound to temporal flow history before first Pass 1 run
+          gl.activeTexture(gl.TEXTURE3);
+          gl.bindTexture(gl.TEXTURE_2D, glFlowPrevTex);
 
           // Bind initial texture units once
           gl.activeTexture(gl.TEXTURE0);
@@ -2462,6 +2902,8 @@ export default function App() {
           gl.bindTexture(gl.TEXTURE_2D, glFlowCurrTex);
           gl.activeTexture(gl.TEXTURE3);
           gl.bindTexture(gl.TEXTURE_2D, glSadDebugTex);
+          gl.activeTexture(gl.TEXTURE4);
+          gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
 
           gl.viewport(0, 0, outCanvas ? outCanvas.width : STAGE_W, outCanvas ? outCanvas.height : STAGE_H);
           glReady = true;
@@ -2469,34 +2911,31 @@ export default function App() {
       } catch {
         glReady = false;
       }
-    }
+    };
+
+    initGlResources();
 
     const maxViewportDims = gl ? (gl.getParameter(gl.MAX_VIEWPORT_DIMS) as Int32Array | null) : null;
     const maxGpuWidth = maxViewportDims ? Math.min(3840, maxViewportDims[0]) : 3840;
     const maxGpuHeight = maxViewportDims ? Math.min(2160, maxViewportDims[1]) : 2160;
 
-    // Resolve Adaptive FBO dimensions based on flowScaleMode, video resolution, targetFps, and real-time GPU dispatch latency
+    // Resolve Adaptive FBO dimensions for 5-Level Pyramid Level 0 based on flowScaleMode, video resolution, and targetFps
+    // (Deterministic per mode/resolution/targetFps to prevent mid-subframe FBO reallocation & temporal flow history resets!)
     const resolveAdaptiveFlowDims = (
-      mode: 'auto' | 'performance' | 'balanced' | 'ultra',
+      mode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme',
       vw: number,
-      targetFpsVal: number | string,
-      gpuLatencyMs: number = 0
+      targetFpsVal: number | string
     ): [number, number] => {
       const numFps = typeof targetFpsVal === 'number' ? targetFpsVal : 60;
-      if (mode === 'performance') return [48, 27];
-      if (mode === 'balanced') return [64, 36];
-      if (mode === 'ultra') return [96, 54];
+      if (mode === 'performance') return [64, 36];
+      if (mode === 'balanced') return [96, 54];
+      if (mode === 'ultra') return [128, 72];
+      if (mode === 'extreme') return [256, 144];
 
-      if (gpuLatencyMs > 20.0) {
-        return [32, 18];
+      if (vw <= 1920 && numFps <= 120) {
+        return [128, 72];
       }
-      if (gpuLatencyMs > 13.5 || vw >= 2560 || numFps >= 120) {
-        return [48, 27];
-      }
-      if (gpuLatencyMs < 6.0 && vw <= 1280 && numFps <= 60) {
-        return [80, 45];
-      }
-      return [64, 36];
+      return [96, 54];
     };
 
     // Procedural 24 FPS Cinema Test Pattern Generator (renders discrete 24 FPS keyframes onto stagingCanvas)
@@ -2575,7 +3014,7 @@ export default function App() {
 
     const clampAspect = (a: number) => Math.max(0.5, Math.min(2.4, a));
 
-    // Execute 3-Level Coarse-to-Fine Optical Flow Pyramid (L2: 16x9 -> L1: 32x18 -> L0: Adaptive 64x36)
+    // Execute 5-Level Coarse-to-Fine Optical Flow Pyramid (L4: 16x9 -> L3: 32x18 -> L2: 64x36 -> L1: 128x72 -> L0: up to 256x144)
     const dispatchGpuFlowPass1 = (
       vw: number,
       vh: number,
@@ -2584,11 +3023,12 @@ export default function App() {
       flowCols: number,
       flowRows: number,
       maxShiftVal: number,
-      emitSadDebugBuffer: boolean
+      emitSadDebugBuffer: boolean,
+      advanceHistory: boolean
     ) => {
       if (!glReady || !gl || !flowProg || !synthProg || !glPrevTex || !glCurrTex) return;
 
-      // Dynamically resize Level 0 Optical Flow & SAD Debug FBOs if Adaptive FBO scale changed
+      // Dynamically resize Level 0 Optical Flow & SAD Debug FBOs if FBO scale changed
       if (flowCols !== allocatedFlowCols || flowRows !== allocatedFlowRows) {
         allocatedFlowCols = flowCols;
         allocatedFlowRows = flowRows;
@@ -2642,13 +3082,16 @@ export default function App() {
         }
       }
 
-      const tmpFlowTex = glFlowPrevTex;
-      glFlowPrevTex = glFlowCurrTex;
-      glFlowCurrTex = tmpFlowTex;
+      // Swap temporal ping-pong flow buffers ONLY when advancing to a new video keyframe
+      if (advanceHistory) {
+        const tmpFlowTex = glFlowPrevTex;
+        glFlowPrevTex = glFlowCurrTex;
+        glFlowCurrTex = tmpFlowTex;
 
-      const tmpFlowFbo = glFlowFboPrev;
-      glFlowFboPrev = glFlowFboCurr;
-      glFlowFboCurr = tmpFlowFbo;
+        const tmpFlowFbo = glFlowFboPrev;
+        glFlowFboPrev = glFlowFboCurr;
+        glFlowFboCurr = tmpFlowFbo;
+      }
 
       // Bind quadBuf (6 vertices) for all Pass 1 FBO pyramid levels
       if (quadBuf) {
@@ -2661,6 +3104,9 @@ export default function App() {
       gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, glCurrTex);
+      // Bind glFlowPrevTex to TEXTURE3 immediately so glSadDebugTex is never bound during FBO rendering (prevents WebGL feedback loop)
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, glFlowPrevTex);
 
       const flowAspect = vw > 0 && vh > 0 ? vw / vh : 16 / 9;
       gl.uniform2f(uFlowTexelLoc, 1.0 / Math.max(1, vw), 1.0 / Math.max(1, vh));
@@ -2673,19 +3119,41 @@ export default function App() {
         gl.uniform1i(uFlowDebugSadLoc, 0);
       }
 
-      // --- PYRAMID LEVEL 2 (Coarse 16x9 Global Motion Search) ---
-      if (glPyrL2Fbo && glPyrL2Tex) {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, glPyrL2Fbo);
-        gl.viewport(0, 0, PYR_L2_COLS, PYR_L2_ROWS);
+      // --- PYRAMID LEVEL 4 (Ultra-Coarse 16x9 Global Camera Pan & Fast Motion Search) ---
+      if (glPyrL4Fbo && glPyrL4Tex) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, glPyrL4Fbo);
+        gl.viewport(0, 0, PYR_L4_COLS, PYR_L4_ROWS);
         gl.activeTexture(gl.TEXTURE2);
         gl.bindTexture(gl.TEXTURE_2D, glFlowPrevTex);
-        if (uFlowPyrLevelLoc) gl.uniform1i(uFlowPyrLevelLoc, 2);
+        if (uFlowPyrLevelLoc) gl.uniform1i(uFlowPyrLevelLoc, 4);
         if (uFlowParentStepLoc) gl.uniform2f(uFlowParentStepLoc, 1.0 / allocatedFlowCols, 1.0 / allocatedFlowRows);
         gl.drawArrays(gl.TRIANGLES, 0, 6);
       }
 
-      // --- PYRAMID LEVEL 1 (Mid 32x18 Object Contour Refinement from Level 2) ---
-      if (glPyrL1Fbo && glPyrL1Tex && glPyrL2Tex) {
+      // --- PYRAMID LEVEL 3 (Coarse 32x18 Object Body Motion Refinement from Level 4) ---
+      if (glPyrL3Fbo && glPyrL3Tex && glPyrL4Tex) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, glPyrL3Fbo);
+        gl.viewport(0, 0, PYR_L3_COLS, PYR_L3_ROWS);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, glPyrL4Tex);
+        if (uFlowPyrLevelLoc) gl.uniform1i(uFlowPyrLevelLoc, 3);
+        if (uFlowParentStepLoc) gl.uniform2f(uFlowParentStepLoc, 1.0 / PYR_L4_COLS, 1.0 / PYR_L4_ROWS);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      }
+
+      // --- PYRAMID LEVEL 2 (Mid 64x36 Silhouette Contour Lock from Level 3; executed for all L0 >= 64x36) ---
+      if (allocatedFlowCols >= PYR_L2_COLS && glPyrL2Fbo && glPyrL2Tex && glPyrL3Tex) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, glPyrL2Fbo);
+        gl.viewport(0, 0, PYR_L2_COLS, PYR_L2_ROWS);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, glPyrL3Tex);
+        if (uFlowPyrLevelLoc) gl.uniform1i(uFlowPyrLevelLoc, 2);
+        if (uFlowParentStepLoc) gl.uniform2f(uFlowParentStepLoc, 1.0 / PYR_L3_COLS, 1.0 / PYR_L3_ROWS);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      }
+
+      // --- PYRAMID LEVEL 1 (Fine 128x72 Thin-Structure & Text Boundary Lock from Level 2; executed when L0 >= 128x72) ---
+      if (allocatedFlowCols >= PYR_L1_COLS && glPyrL1Fbo && glPyrL1Tex && glPyrL2Tex) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, glPyrL1Fbo);
         gl.viewport(0, 0, PYR_L1_COLS, PYR_L1_ROWS);
         gl.activeTexture(gl.TEXTURE2);
@@ -2695,25 +3163,44 @@ export default function App() {
         gl.drawArrays(gl.TRIANGLES, 0, 6);
       }
 
-      // --- PYRAMID LEVEL 0 (Fine 64x36 Sub-Pixel Lucas-Kanade & Temporal IIR from Level 1 + History) ---
+      // --- PYRAMID LEVEL 0 (Final Target FBO: 64x36 / 96x54 / 128x72 / 256x144 Sub-Pixel Lucas-Kanade) ---
+      const l0ParentTex =
+        allocatedFlowCols >= PYR_L1_COLS
+          ? glPyrL1Tex
+          : allocatedFlowCols >= PYR_L2_COLS
+          ? glPyrL2Tex
+          : glPyrL3Tex;
+      const l0ParentCols =
+        allocatedFlowCols >= PYR_L1_COLS
+          ? PYR_L1_COLS
+          : allocatedFlowCols >= PYR_L2_COLS
+          ? PYR_L2_COLS
+          : PYR_L3_COLS;
+      const l0ParentRows =
+        allocatedFlowCols >= PYR_L1_COLS
+          ? PYR_L1_ROWS
+          : allocatedFlowCols >= PYR_L2_COLS
+          ? PYR_L2_ROWS
+          : PYR_L3_ROWS;
+
       gl.bindFramebuffer(gl.FRAMEBUFFER, glFlowFboCurr);
       gl.viewport(0, 0, allocatedFlowCols, allocatedFlowRows);
       if (adrenoTileOpt) {
-        gl.clearColor(0.5, 0.5, 1.0, 0.0);
+        gl.clearColor(128.0 / 255.0, 128.0 / 255.0, 1.0, 0.0);
         gl.clear(gl.COLOR_BUFFER_BIT);
       }
       gl.activeTexture(gl.TEXTURE2);
-      gl.bindTexture(gl.TEXTURE_2D, glPyrL1Tex || glFlowPrevTex);
-      gl.activeTexture(gl.TEXTURE3);
-      gl.bindTexture(gl.TEXTURE_2D, glFlowPrevTex);
+      gl.bindTexture(gl.TEXTURE_2D, l0ParentTex || glFlowPrevTex);
       if (uFlowPyrLevelLoc) gl.uniform1i(uFlowPyrLevelLoc, 0);
-      if (uFlowParentStepLoc) gl.uniform2f(uFlowParentStepLoc, 1.0 / PYR_L1_COLS, 1.0 / PYR_L1_ROWS);
+      if (uFlowParentStepLoc) gl.uniform2f(uFlowParentStepLoc, 1.0 / l0ParentCols, 1.0 / l0ParentRows);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-      // When Symmetric SAD Heatmap debug mode is active, run Level 0 with u_debugSad = 1 into glSadDebugFbo
+      // When Symmetric SAD Heatmap debug mode is active, convert glFlowCurrTex.a into thermal RGB in glSadDebugFbo (1 lookup!)
       if (emitSadDebugBuffer && glSadDebugFbo && glSadDebugTex) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, glSadDebugFbo);
         gl.viewport(0, 0, allocatedFlowCols, allocatedFlowRows);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, glFlowCurrTex);
         if (uFlowDebugSadLoc) {
           gl.uniform1i(uFlowDebugSadLoc, 1);
         }
@@ -2733,11 +3220,19 @@ export default function App() {
         gl.vertexAttribPointer(synthPosLoc, 2, gl.FLOAT, false, 0, 0);
       }
 
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, glCurrTex);
       gl.activeTexture(gl.TEXTURE2);
       gl.bindTexture(gl.TEXTURE_2D, glFlowCurrTex);
       if (glSadDebugTex) {
         gl.activeTexture(gl.TEXTURE3);
         gl.bindTexture(gl.TEXTURE_2D, glSadDebugTex);
+      }
+      if (glSubframeMidTex) {
+        gl.activeTexture(gl.TEXTURE4);
+        gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
       }
     };
 
@@ -2763,7 +3258,7 @@ export default function App() {
         allocatedTexH = vh;
       }
 
-      // 1. O(1) Ping-Pong Keyframe Texture Swap + Zero-Copy texSubImage2D Upload (Native 1080p/4K)
+      // 1. O(1) Ping-Pong Keyframe Texture Swap + Zero-Copy texImage2D Upload (Native 1080p/4K)
       const tmpTex = glPrevTex;
       glPrevTex = glCurrTex;
       glCurrTex = tmpTex;
@@ -2789,18 +3284,42 @@ export default function App() {
       gl.bindTexture(gl.TEXTURE_2D, glCurrTex);
       uploadSourceToBoundTexture();
 
-      // When starting a new video, changing resolution, or seeking, initialize glPrevTex with the same frame
+      // When starting a new video, changing resolution, or seeking, initialize glPrevTex with the same frame and clear stale temporal flow
       if (resetHistory || resolutionChanged) {
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
         uploadSourceToBoundTexture();
+        if (glFlowFboPrev && glFlowFboCurr) {
+          gl.clearColor(128.0 / 255.0, 128.0 / 255.0, 1.0, 0.0);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, glFlowFboPrev);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, glFlowFboCurr);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        }
       }
 
       if (!computeOpticalFlow) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.useProgram(synthProg);
+        if (meshBuf) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
+          gl.vertexAttribPointer(synthPosLoc, 2, gl.FLOAT, false, 0, 0);
+        }
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, glCurrTex);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, glFlowCurrTex);
+        if (glSadDebugTex) {
+          gl.activeTexture(gl.TEXTURE3);
+          gl.bindTexture(gl.TEXTURE_2D, glSadDebugTex);
+        }
+        if (glSubframeMidTex) {
+          gl.activeTexture(gl.TEXTURE4);
+          gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
+        }
         return;
       }
 
@@ -2812,7 +3331,8 @@ export default function App() {
         flowCols,
         flowRows,
         maxShiftVal,
-        emitSadDebugBuffer
+        emitSadDebugBuffer,
+        true
       );
     };
 
@@ -2827,6 +3347,7 @@ export default function App() {
     let demoFrameCounter = 0;
     let lastDecodedFrameCount = -1;
     let lastPass1Signature = '';
+    let lastPass2ASignature = '';
 
     const tick = (now: number) => {
       animId = requestAnimationFrame(tick);
@@ -2880,7 +3401,9 @@ export default function App() {
       let activeVw = STAGE_W;
       let activeVh = STAGE_H;
 
-      const isFlowNeeded = effectiveMode === 'optical' || cfg.showSadHeatmap;
+      const isFlowNeeded =
+        effectiveMode === 'optical' ||
+        cfg.showSadHeatmap;
 
       // Branch A: Built-in 24.0 FPS Cinema Motion Test Generator (works immediately with zero external video dependencies!)
       if (cfg.isDemoTestActive && stagingCtx) {
@@ -2891,6 +3414,26 @@ export default function App() {
         if (stagingCanvas.width !== vw || stagingCanvas.height !== vh) {
           stagingCanvas.width = vw;
           stagingCanvas.height = vh;
+        }
+
+        if (cfg.aspectMode !== 'fill') {
+          const dispW = outCanvas?.clientWidth || vw;
+          const dispH = outCanvas?.clientHeight || vh;
+          const canvasAspect = dispW > 0 && dispH > 0 ? dispW / dispH : vw / vh;
+          const videoAspect = vw / vh;
+          if (cfg.aspectMode === 'contain') {
+            if (videoAspect > canvasAspect) {
+              uvScaleY = videoAspect / canvasAspect;
+            } else {
+              uvScaleX = canvasAspect / videoAspect;
+            }
+          } else if (cfg.aspectMode === 'cover') {
+            if (videoAspect > canvasAspect) {
+              uvScaleX = canvasAspect / videoAspect;
+            } else {
+              uvScaleY = videoAspect / canvasAspect;
+            }
+          }
         }
 
         const rate = Math.max(0.25, cfg.playbackRate || 1.0);
@@ -2904,8 +3447,7 @@ export default function App() {
         const [targetFlowCols, targetFlowRows] = resolveAdaptiveFlowDims(
           cfg.flowScaleMode,
           vw,
-          cfg.effectiveTargetFps,
-          procLatencyAvgRef.current
+          cfg.effectiveTargetFps
         );
 
         const elapsedSinceUpload = now - lastKeyframeUploadPerfNowRef.current;
@@ -2975,7 +3517,12 @@ export default function App() {
           }
           lastPass1Signature = `demo:${demoFrameCounter}:${isFlowNeeded}:${cfg.showSadHeatmap}:${targetFlowCols}x${targetFlowRows}:${maxShiftVal.toFixed(5)}:${cfg.sceneCutProtection}:${adrenoOptVal}`;
           subframeTickIndex = 0;
-          pllPhase = Math.min(0.45, Math.max(0.08, 0.5 * nominalDemoStep));
+          // VSync PLL v2: Carry fractional phase remainder across keyframe boundary for zero-stutter 24->60/120 cadence
+          const wrappedPhase = (pllPhase + nominalDemoStep) - 1.0;
+          pllPhase = Math.min(
+            Math.max(0.5 * nominalDemoStep, wrappedPhase > 0.02 && wrappedPhase < 0.65 ? wrappedPhase : 0.5 * nominalDemoStep),
+            0.65
+          );
         } else {
           const pass1Sig = `demo:${demoFrameCounter}:${isFlowNeeded}:${cfg.showSadHeatmap}:${targetFlowCols}x${targetFlowRows}:${maxShiftVal.toFixed(5)}:${cfg.sceneCutProtection}:${adrenoOptVal}`;
           if (isFlowNeeded && lastPass1Signature !== pass1Sig) {
@@ -2987,17 +3534,17 @@ export default function App() {
               targetFlowCols,
               targetFlowRows,
               maxShiftVal,
-              cfg.showSadHeatmap
+              cfg.showSadHeatmap,
+              false
             );
             lastPass1Signature = pass1Sig;
           }
           subframeTickIndex += 1;
-          const clockPhase = Math.min(
-            0.96,
-            Math.max(0.08, (now - lastKeyframeUploadPerfNowRef.current + 0.5 * pllDisplayDtMs) / demoIntervalMs)
-          );
-          const nextLinear = pllPhase + nominalDemoStep;
-          pllPhase = Math.min(0.95, Math.max(pllPhase + nominalDemoStep * 0.55, nextLinear * 0.72 + clockPhase * 0.28));
+          const clockPhase = (now - lastKeyframeUploadPerfNowRef.current + 0.5 * pllDisplayDtMs) / demoIntervalMs;
+          const nextUniform = pllPhase + nominalDemoStep;
+          const phaseErr = Math.max(-0.08, Math.min(0.08, clockPhase - nextUniform));
+          const lockGain = cfg.subframeCascadeEnabled ? 0.22 : 0.16;
+          pllPhase = Math.min(0.985, Math.max(pllPhase + nominalDemoStep * 0.76, nextUniform + phaseErr * lockGain));
         }
 
         if (cfg.manualSubframePhase !== null) {
@@ -3057,11 +3604,11 @@ export default function App() {
           mediaDeltaSec >= 0.004;
 
         const fallbackIntervalSec = Math.max(
-          0.022,
-          (estimatedFrameIntervalMsRef.current * 0.00082) * rate
+          0.020,
+          (estimatedFrameIntervalMsRef.current * 0.00085) * rate
         );
         const rVfcStalled =
-          rVfcActiveRef.current && timeSinceLastUploadMs > 55 && mediaDeltaSec >= 0.012;
+          rVfcActiveRef.current && timeSinceLastUploadMs > 90 && mediaDeltaSec >= 0.024;
         const isFirstFrame = lastDecodedVideoTimeRef.current < 0;
         const hasGenuineTimeStep = mediaDeltaSec >= 0.004;
 
@@ -3070,27 +3617,36 @@ export default function App() {
           (isFirstFrame ||
             (hasNewVideoFrameRef.current && (hasGenuineTimeStep || isScrubbingRef.current)) ||
             hasNewQualityFrame ||
-            mediaDeltaSec >= fallbackIntervalSec ||
+            (!rVfcActiveRef.current && currentDecodedFrames <= 0 && mediaDeltaSec >= fallbackIntervalSec) ||
             rVfcStalled);
 
-        const intervalMs = Math.max(15.0, estimatedFrameIntervalMsRef.current);
-        const expectedVidTicks = Math.max(1.0, intervalMs / Math.max(4.0, pllDisplayDtMs));
+        if (rVfcStalled) {
+          armVideoFrameCallback();
+        }
+
+        const intervalMs = Math.max(15.0, snapToCanonicalCadenceMs(estimatedFrameIntervalMsRef.current / rate) * rate);
+        const effectiveTickDtMs = Math.max(4.0, Math.min(36.0, pllDisplayDtMs));
+        const expectedVidTicks = Math.max(1.0, intervalMs / effectiveTickDtMs);
         const nominalVidStep = 1.0 / expectedVidTicks;
 
         const [targetFlowCols, targetFlowRows] = resolveAdaptiveFlowDims(
           cfg.flowScaleMode,
           vw,
-          cfg.effectiveTargetFps,
-          procLatencyAvgRef.current
+          cfg.effectiveTargetFps
         );
 
         if (shouldUploadFrame) {
+          // Only reset history on genuine backward seeks or large timeline jumps (> 0.65s), never on normal 24/30/60fps playback steps!
+          const isBackwardOrJump =
+            vidTime < lastDecodedVideoTimeRef.current - 0.015 ||
+            mediaDeltaSec > Math.max(0.65, (estimatedFrameIntervalMsRef.current * 0.012) * rate);
           const resetHist =
-            isFirstFrame || mediaDeltaSec > 0.35;
+            isFirstFrame || isScrubbingRef.current || isBackwardOrJump;
           const elapsed = now - lastKeyframeUploadPerfNowRef.current;
-          if ((hasNewQualityFrame || hasGenuineTimeStep) && elapsed >= 14 && elapsed <= 90) {
+          if ((hasNewQualityFrame || hasGenuineTimeStep) && elapsed >= 12 && elapsed <= 120) {
+            const stabilizedElapsed = snapToCanonicalCadenceMs(elapsed / rate) * rate;
             estimatedFrameIntervalMsRef.current =
-              estimatedFrameIntervalMsRef.current * 0.82 + elapsed * 0.18;
+              estimatedFrameIntervalMsRef.current * 0.85 + stabilizedElapsed * 0.15;
           }
           if (currentDecodedFrames > 0) {
             lastDecodedFrameCount = currentDecodedFrames;
@@ -3120,7 +3676,17 @@ export default function App() {
             );
             lastPass1Signature = updatedSig;
             subframeTickIndex = 0;
-            pllPhase = Math.min(0.45, Math.max(0.08, 0.5 * nominalVidStep));
+            // VSync PLL v2: Carry fractional phase remainder across keyframe boundary for uniform sub-frame cadence
+            const wrappedPhase = (pllPhase + nominalVidStep) - 1.0;
+            pllPhase = resetHist
+              ? Math.min(0.45, Math.max(0.08, 0.5 * nominalVidStep))
+              : Math.min(
+                  Math.max(
+                    0.35 * nominalVidStep,
+                    wrappedPhase > 0.02 && wrappedPhase < 0.65 ? wrappedPhase : 0.5 * nominalVidStep
+                  ),
+                  0.65
+                );
           } catch {
             // Ignore if video frame is mid-decode
           }
@@ -3135,18 +3701,18 @@ export default function App() {
               targetFlowCols,
               targetFlowRows,
               maxShiftVal,
-              cfg.showSadHeatmap
+              cfg.showSadHeatmap,
+              false
             );
             lastPass1Signature = pass1Sig;
           }
           subframeTickIndex += 1;
           const elapsedSinceKeyframeMs = Math.max(0, now - lastKeyframeUploadPerfNowRef.current);
-          const clockPhase = Math.min(
-            0.96,
-            Math.max(0.08, (elapsedSinceKeyframeMs + 0.5 * pllDisplayDtMs) / intervalMs)
-          );
-          const nextLinear = pllPhase + nominalVidStep;
-          pllPhase = Math.min(0.95, Math.max(pllPhase + nominalVidStep * 0.55, nextLinear * 0.72 + clockPhase * 0.28));
+          const clockPhase = (elapsedSinceKeyframeMs + 0.5 * pllDisplayDtMs) / intervalMs;
+          const nextUniform = pllPhase + nominalVidStep;
+          const phaseErr = Math.max(-0.08, Math.min(0.08, clockPhase - nextUniform));
+          const lockGain = cfg.subframeCascadeEnabled ? 0.22 : 0.16;
+          pllPhase = Math.min(0.985, Math.max(pllPhase + nominalVidStep * 0.76, nextUniform + phaseErr * lockGain));
         }
 
         // Automatic VSync Phase-Locked Loop (PLL) sub-frame progression:
@@ -3168,7 +3734,7 @@ export default function App() {
       const viewportPhysH = Math.round((outCanvas?.clientHeight || activeVh) * dpr);
       const baseW = Math.max(activeVw, viewportPhysW);
       const baseH = Math.max(activeVh, viewportPhysH);
-      const scaleMult = cfg.upscaleEnabled ? Math.max(1.0, cfg.upscaleFactor * 0.75) : 1.0;
+      const scaleMult = cfg.upscaleEnabled ? Math.max(1.0, cfg.effectiveUpscaleFactor * 0.75) : 1.0;
       const rawOutW = Math.round(baseW * scaleMult);
       const rawOutH = Math.round(baseH * scaleMult);
       const fitScale = Math.min(1.0, maxGpuWidth / Math.max(1, rawOutW), maxGpuHeight / Math.max(1, rawOutH));
@@ -3195,7 +3761,7 @@ export default function App() {
         gl.bindTexture(gl.TEXTURE_2D, glSadDebugTex);
       }
 
-      // Pass 2: Synthesize Intermediate Frame Directly to Screen WebGL Framebuffer
+      // Pass 2: Synthesize Intermediate Frame (Pass 2A Anchor FBO + Pass 2B Secondary Sub-Frame Cascade)
       const shaderMode =
         effectiveMode === 'off'
           ? 0
@@ -3203,6 +3769,9 @@ export default function App() {
           ? 1
           : 2; // 'optical'
       const haloGuardVal = cfg.dejudderHaloControl * 0.01;
+      const cascadeShaderVal =
+        shaderMode === 2 && cfg.subframeCascadeEnabled ? cfg.effectiveSubframeCascadeMult : 0;
+      const coherenceGuardVal = cfg.subframeCoherenceGuard * 0.01;
       const splitVal = cfg.splitCompareMode ? 1 : 0;
       const monoVal = cfg.monochromeFilter ? 1 : 0;
       const vectorsVal = cfg.showVectors && effectiveMode !== 'off' ? 1 : 0;
@@ -3286,9 +3855,9 @@ export default function App() {
         gl.uniform1i(uUpscaleModeLoc, shaderUpscaleMode);
         lastUniforms.upscaleMode = shaderUpscaleMode;
       }
-      if (lastUniforms.upscaleFactor !== cfg.upscaleFactor) {
-        gl.uniform1f(uUpscaleFactorLoc, cfg.upscaleFactor);
-        lastUniforms.upscaleFactor = cfg.upscaleFactor;
+      if (lastUniforms.upscaleFactor !== cfg.effectiveUpscaleFactor) {
+        gl.uniform1f(uUpscaleFactorLoc, cfg.effectiveUpscaleFactor);
+        lastUniforms.upscaleFactor = cfg.effectiveUpscaleFactor;
       }
       if (lastUniforms.upscaleSharp !== cfg.upscaleSharpness) {
         gl.uniform1f(uUpscaleSharpLoc, cfg.upscaleSharpness);
@@ -3306,8 +3875,72 @@ export default function App() {
         gl.uniform1i(uAdrenoTrue10Loc, adrenoTrue10Val);
         lastUniforms.adrenoTrue10 = adrenoTrue10Val;
       }
+      if (lastUniforms.subframeCascade !== cascadeShaderVal) {
+        if (uSubframeCascadeLoc) gl.uniform1i(uSubframeCascadeLoc, cascadeShaderVal);
+        lastUniforms.subframeCascade = cascadeShaderVal;
+      }
+      if (lastUniforms.coherenceGuard !== coherenceGuardVal) {
+        if (uCoherenceGuardLoc) gl.uniform1f(uCoherenceGuardLoc, coherenceGuardVal);
+        lastUniforms.coherenceGuard = coherenceGuardVal;
+      }
 
-      // Update sub-frame phase alpha and draw 2D Elastic Subdivided Mesh (64x36 = 13,824 vertices) directly to screen
+      // Pass 2A: Synthesize Primary Anchor Intermediate Frame (I_0.5) into glSubframeMidFbo (once per keyframe pair!)
+      if (cascadeShaderVal > 0 && glSubframeMidFbo && glSubframeMidTex) {
+        const anchorFit = Math.min(1.0, 1920 / Math.max(1, activeVw), 1080 / Math.max(1, activeVh));
+        const targetSubW = Math.max(480, Math.round(activeVw * anchorFit));
+        const targetSubH = Math.max(270, Math.round(activeVh * anchorFit));
+        const pass2ASig = `${lastPass1Signature}:${targetSubW}x${targetSubH}:${cfg.interpStrength.toFixed(3)}:${haloGuardVal.toFixed(3)}`;
+
+        if (lastPass2ASignature !== pass2ASig) {
+          lastPass2ASignature = pass2ASig;
+          // Unbind glSubframeMidTex from TEXTURE4 before rendering into glSubframeMidFbo to prevent WebGL feedback loop
+          gl.activeTexture(gl.TEXTURE4);
+          gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
+
+          if (allocatedSubframeW !== targetSubW || allocatedSubframeH !== targetSubH) {
+            allocatedSubframeW = targetSubW;
+            allocatedSubframeH = targetSubH;
+            gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
+            gl.texImage2D(
+              gl.TEXTURE_2D,
+              0,
+              gl.RGBA,
+              targetSubW,
+              targetSubH,
+              0,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              null
+            );
+            gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
+          }
+
+          gl.bindFramebuffer(gl.FRAMEBUFFER, glSubframeMidFbo);
+          gl.viewport(0, 0, allocatedSubframeW, allocatedSubframeH);
+          if (uFboPassLoc) gl.uniform1i(uFboPassLoc, 1);
+          if (uSubframeCascadeLoc) gl.uniform1i(uSubframeCascadeLoc, 0);
+          gl.uniform1f(uAlphaLoc, 0.5);
+
+          if (meshBuf) {
+            gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
+            gl.vertexAttribPointer(synthPosLoc, 2, gl.FLOAT, false, 0, 0);
+            gl.drawArrays(gl.TRIANGLES, 0, meshVertexCount);
+          } else {
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+          }
+
+          // Restore Screen Pass 2B state
+          if (uFboPassLoc) gl.uniform1i(uFboPassLoc, 0);
+          if (uSubframeCascadeLoc) gl.uniform1i(uSubframeCascadeLoc, cascadeShaderVal);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, outCanvas ? outCanvas.width : targetOutW, outCanvas ? outCanvas.height : targetOutH);
+        }
+
+        gl.activeTexture(gl.TEXTURE4);
+        gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
+      }
+
+      // Pass 2B: Update sub-frame phase alpha and draw 2D Elastic Subdivided Mesh directly to screen
       gl.uniform1f(uAlphaLoc, alpha);
       if (meshBuf) {
         gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
@@ -3358,17 +3991,19 @@ export default function App() {
           120,
           Math.max(12, Math.round(1000 / Math.max(8, estimatedFrameIntervalMsRef.current)))
         );
+        const cascadeBadgeStr =
+          cascadeShaderVal > 0 ? ` • Суб-FBO ${cascadeShaderVal}x` : '';
 
         if (hudMetricsBadgeRef.current) {
           hudMetricsBadgeRef.current.textContent = `${
             cfg.isDemoTestActive ? 'ТЕСТ 24 FPS • ' : cfg.isAdrenoActive ? 'Adreno GMEM • ' : ''
-          }${srcFps}→${screenHz} FPS • Mesh ${MESH_COLS}×${MESH_ROWS} • Pyr 3-Lvl (${allocatedFlowCols}×${allocatedFlowRows}) • α=${alpha.toFixed(2)} • Синтез: ${synthesizedCounterRef.current}`;
+          }${srcFps}→${screenHz} FPS • Mesh ${MESH_COLS}×${MESH_ROWS} • Pyr 5-Lvl (${allocatedFlowCols}×${allocatedFlowRows})${cascadeBadgeStr} • α=${alpha.toFixed(2)} • Синтез: ${synthesizedCounterRef.current}`;
         }
         if (playerSynthCountRef.current) {
           playerSynthCountRef.current.textContent = String(synthesizedCounterRef.current);
         }
         if (playerAlphaBadgeRef.current) {
-          playerAlphaBadgeRef.current.textContent = `α = ${alpha.toFixed(2)} (${srcFps} → ${screenHz} FPS)`;
+          playerAlphaBadgeRef.current.textContent = `α = ${alpha.toFixed(2)} (${srcFps} → ${screenHz} FPS${cascadeBadgeStr})`;
         }
         if (timecodeDisplayRef.current) {
           timecodeDisplayRef.current.textContent = formatTime(currentTimeRef.current);
@@ -3378,9 +4013,11 @@ export default function App() {
         }
         const maxDur = cfg.duration > 0 ? cfg.duration : Math.max(100, currentTimeRef.current);
         if (scrubberInputRef.current && !isScrubbingRef.current) {
+          scrubberInputRef.current.max = String(maxDur);
           scrubberInputRef.current.value = String(Math.min(maxDur, currentTimeRef.current));
         }
         if (fsScrubberInputRef.current && !isScrubbingRef.current) {
+          fsScrubberInputRef.current.max = String(maxDur);
           fsScrubberInputRef.current.value = String(Math.min(maxDur, currentTimeRef.current));
         }
         if (cfg.rememberPosition && currentTimeRef.current > 1 && !cfg.isDemoTestActive) {
@@ -3436,7 +4073,7 @@ export default function App() {
             }): ${latencyStr} мс`;
           }
           if (youHzLabelRef.current) {
-            youHzLabelRef.current.textContent = `Экран: ${screenHz} Гц • 2D Mesh + 3-Lvl Pyramid`;
+            youHzLabelRef.current.textContent = `Экран: ${screenHz} Гц • 2D Mesh ${MESH_COLS}×${MESH_ROWS} + 5-Lvl Pyr${cascadeBadgeStr}`;
           }
 
           const tCanvas = telemetryCanvasRef.current;
@@ -3474,11 +4111,17 @@ export default function App() {
       if (gl) {
         if (glPrevTex) gl.deleteTexture(glPrevTex);
         if (glCurrTex) gl.deleteTexture(glCurrTex);
+        if (glSubframeMidTex) gl.deleteTexture(glSubframeMidTex);
+        if (glPyrL4Tex) gl.deleteTexture(glPyrL4Tex);
+        if (glPyrL3Tex) gl.deleteTexture(glPyrL3Tex);
         if (glPyrL2Tex) gl.deleteTexture(glPyrL2Tex);
         if (glPyrL1Tex) gl.deleteTexture(glPyrL1Tex);
         if (glFlowPrevTex) gl.deleteTexture(glFlowPrevTex);
         if (glFlowCurrTex) gl.deleteTexture(glFlowCurrTex);
         if (glSadDebugTex) gl.deleteTexture(glSadDebugTex);
+        if (glSubframeMidFbo) gl.deleteFramebuffer(glSubframeMidFbo);
+        if (glPyrL4Fbo) gl.deleteFramebuffer(glPyrL4Fbo);
+        if (glPyrL3Fbo) gl.deleteFramebuffer(glPyrL3Fbo);
         if (glPyrL2Fbo) gl.deleteFramebuffer(glPyrL2Fbo);
         if (glPyrL1Fbo) gl.deleteFramebuffer(glPyrL1Fbo);
         if (glFlowFboPrev) gl.deleteFramebuffer(glFlowFboPrev);
@@ -3655,10 +4298,14 @@ export default function App() {
         fsScrubberInputRef.current.value = String(targetTime);
       }
 
-      const nowMs = performance.now();
-      if (videoRef.current && hasLoadedVideo && nowMs - lastSwipeSeekSyncRef.current >= 45) {
-        lastSwipeSeekSyncRef.current = nowMs;
-        videoRef.current.currentTime = targetTime;
+      if (isDemoTestActive) {
+        forceDemoStepRef.current = true;
+      } else {
+        const nowMs = performance.now();
+        if (videoRef.current && hasLoadedVideo && nowMs - lastSwipeSeekSyncRef.current >= 45) {
+          lastSwipeSeekSyncRef.current = nowMs;
+          videoRef.current.currentTime = targetTime;
+        }
       }
 
       const sign = actualDelta >= 0 ? '+' : '';
@@ -3686,7 +4333,10 @@ export default function App() {
     const g = swipeGestureRef.current;
     if (g.active && g.pointerId === e.pointerId) {
       if (g.lockedAxis === 'horizontal') {
-        if (videoRef.current && hasLoadedVideo) {
+        if (isDemoTestActive) {
+          forceDemoStepRef.current = true;
+          forceRedrawRef.current = true;
+        } else if (videoRef.current && hasLoadedVideo) {
           videoRef.current.currentTime = currentTimeRef.current;
         }
         isScrubbingRef.current = false;
@@ -3882,6 +4532,9 @@ export default function App() {
           sourceLabel: folderSource,
           addedAt: Date.now()
         });
+
+        // Generate video frame thumbnail preview icon asynchronously
+        generateVideoThumbnail(url, stableId);
       });
 
       if (detectedFolder) {
@@ -3891,6 +4544,20 @@ export default function App() {
       if (addedVideos.length > 0) {
         setUserVideos((prev) => {
           const addedIds = new Set(addedVideos.map((v) => v.id));
+          prev.forEach((p) => {
+            if (
+              addedIds.has(p.id) &&
+              p.fileUrl &&
+              p.fileUrl.startsWith('blob:') &&
+              p.fileUrl !== activeVideoUrlRef.current
+            ) {
+              try {
+                URL.revokeObjectURL(p.fileUrl);
+              } catch {
+                // Ignore
+              }
+            }
+          });
           return [...addedVideos, ...prev.filter((p) => !addedIds.has(p.id))];
         });
         setPlaylist((prev) => {
@@ -3911,7 +4578,7 @@ export default function App() {
         }
       }
     },
-    [loadSubtitleFileObject, showToast, startRealVideoUrl]
+    [generateVideoThumbnail, loadSubtitleFileObject, showToast, startRealVideoUrl]
   );
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -4000,6 +4667,9 @@ export default function App() {
         interpStrength,
         motionScale,
         dejudderHaloControl,
+        subframeCascadeEnabled,
+        subframeCascadeMode,
+        subframeCoherenceGuard,
         sceneCutProtection,
         flowScaleMode,
         upscaleEnabled,
@@ -4033,6 +4703,9 @@ export default function App() {
     interpStrength,
     motionScale,
     dejudderHaloControl,
+    subframeCascadeEnabled,
+    subframeCascadeMode,
+    subframeCoherenceGuard,
     sceneCutProtection,
     flowScaleMode,
     upscaleEnabled,
@@ -4062,6 +4735,9 @@ export default function App() {
       if (s.interpStrength !== undefined) setInterpStrength(s.interpStrength);
       if (s.motionScale !== undefined) setMotionScale(s.motionScale);
       if (s.dejudderHaloControl !== undefined) setDejudderHaloControl(s.dejudderHaloControl);
+      if (s.subframeCascadeEnabled !== undefined) setSubframeCascadeEnabled(s.subframeCascadeEnabled);
+      if (s.subframeCascadeMode !== undefined) setSubframeCascadeMode(s.subframeCascadeMode);
+      if (s.subframeCoherenceGuard !== undefined) setSubframeCoherenceGuard(s.subframeCoherenceGuard);
       if (s.sceneCutProtection !== undefined) setSceneCutProtection(s.sceneCutProtection);
       if (s.flowScaleMode !== undefined) setFlowScaleMode(s.flowScaleMode);
       if (s.upscaleEnabled !== undefined) setUpscaleEnabled(s.upscaleEnabled);
@@ -4123,6 +4799,9 @@ export default function App() {
     setInterpStrength(def.interpStrength);
     setMotionScale(def.motionScale);
     setDejudderHaloControl(def.dejudderHaloControl);
+    setSubframeCascadeEnabled(def.subframeCascadeEnabled);
+    setSubframeCascadeMode(def.subframeCascadeMode);
+    setSubframeCoherenceGuard(def.subframeCoherenceGuard);
     setMonochromeFilter(def.monochromeFilter);
     setShowVectors(def.showVectors);
     setShowSadHeatmap(def.showSadHeatmap);
@@ -4173,6 +4852,7 @@ export default function App() {
     setUserVideos((prev) => [newItem, ...prev]);
     setPlaylist((prev) => [newItem, ...prev]);
     setActivePlaylistIndex(0);
+    generateVideoThumbnail(cleanUrl, newItem.id);
 
     setUrlModalOpen(false);
     startRealVideoUrl(cleanUrl, title, 'Сеть • Direct Stream', newItem.id, true);
@@ -4658,13 +5338,29 @@ export default function App() {
                     border: '1px solid var(--border-soft)'
                   }}
                 >
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <div
-                      className="w-8 h-8 rounded-full flex items-center justify-center shrink-0"
-                      style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
-                    >
-                      <Play className="w-4 h-4 fill-current ml-0.5" />
-                    </div>
+                  <div className="flex items-center gap-3 min-w-0">
+                    {resumeVideoItem.thumbnailUrl ? (
+                      <div
+                        className="w-16 h-10 rounded-xl overflow-hidden relative shrink-0 border"
+                        style={{ borderColor: 'var(--border-soft)', background: '#000' }}
+                      >
+                        <img
+                          src={resumeVideoItem.thumbnailUrl}
+                          alt={resumeVideoItem.title}
+                          className="w-full h-full object-cover block"
+                        />
+                        <div className="absolute inset-0 bg-black/30 flex items-center justify-center">
+                          <Play className="w-3.5 h-3.5 text-white fill-current ml-0.5 drop-shadow" />
+                        </div>
+                      </div>
+                    ) : (
+                      <div
+                        className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
+                        style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
+                      >
+                        <Play className="w-4 h-4 fill-current ml-0.5" />
+                      </div>
+                    )}
                     <div className="min-w-0">
                       <div className="text-xs font-bold truncate">
                         Продолжить: {resumeVideoItem.title}
@@ -4759,10 +5455,45 @@ export default function App() {
                         className="m3-setting-item cursor-pointer"
                         style={{ borderRadius: '22px' }}
                       >
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div className="m3-icon-box">
-                            <Play className="w-5 h-5 fill-current ml-0.5" />
-                          </div>
+                        <div className="flex items-center gap-3.5 min-w-0">
+                          {vid.thumbnailUrl ? (
+                            <div
+                              className="w-20 h-12 rounded-xl overflow-hidden relative shrink-0 border shadow-sm"
+                              style={{ borderColor: 'var(--border-soft)', background: '#09090b' }}
+                            >
+                              <img
+                                src={vid.thumbnailUrl}
+                                alt={vid.title}
+                                className="w-full h-full object-cover block"
+                              />
+                              <div className="absolute inset-0 bg-black/25 flex items-center justify-center">
+                                <div className="w-6 h-6 rounded-full bg-black/65 text-white flex items-center justify-center">
+                                  <Play className="w-3 h-3 fill-current ml-0.5" />
+                                </div>
+                              </div>
+                              {vid.duration > 0 && (
+                                <span className="absolute bottom-1 right-1 px-1 py-0.2 rounded bg-black/80 text-white font-mono-code text-[9px] font-bold leading-tight">
+                                  {formatTime(vid.duration)}
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <div
+                              className="w-20 h-12 rounded-xl flex items-center justify-center shrink-0 relative border"
+                              style={{
+                                background: 'var(--surface-elevated)',
+                                borderColor: 'var(--border-soft)',
+                                color: 'var(--text-main)'
+                              }}
+                            >
+                              <FileVideo className="w-5 h-5 opacity-75" />
+                              {vid.duration > 0 && (
+                                <span className="absolute bottom-1 right-1 px-1 py-0.2 rounded bg-black/75 text-white font-mono-code text-[9px] font-bold leading-tight">
+                                  {formatTime(vid.duration)}
+                                </span>
+                              )}
+                            </div>
+                          )}
                           <div className="min-w-0">
                             <div className="rex-serif font-bold text-sm truncate">{vid.title}</div>
                             <div className="flex flex-wrap items-center gap-1.5 mt-1">
@@ -4869,24 +5600,27 @@ export default function App() {
               {/* Adaptive FBO Flow Scale Quick Control */}
               <div className="p-3.5 rounded-2xl flex flex-col gap-2" style={{ background: 'var(--surface-elevated)' }}>
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold">Масштаб буфера потока (Adaptive FBO)</span>
+                  <span className="text-xs font-bold">Масштаб буфера потока (5-Lvl Pyramid FBO)</span>
                   <span className="text-[11px] font-mono-code font-bold" style={{ color: 'var(--text-sub)' }}>
                     {flowScaleMode === 'auto'
-                      ? 'Адаптивный'
+                      ? 'Адаптивный (5-Lvl)'
                       : flowScaleMode === 'performance'
-                      ? '48×27 Скорость'
+                      ? '64×36 Скорость'
                       : flowScaleMode === 'balanced'
-                      ? '64×36 Баланс'
-                      : '96×54 Ультра'}
+                      ? '96×54 Баланс'
+                      : flowScaleMode === 'ultra'
+                      ? '128×72 Ультра'
+                      : '256×144 Максимум'}
                   </span>
                 </div>
                 <div className="rex-segmented">
                   {(
                     [
                       { id: 'auto', label: 'Авто' },
-                      { id: 'performance', label: 'Скорость' },
-                      { id: 'balanced', label: 'Баланс' },
-                      { id: 'ultra', label: 'Ультра' }
+                      { id: 'performance', label: '64×36' },
+                      { id: 'balanced', label: '96×54' },
+                      { id: 'ultra', label: '128×72' },
+                      { id: 'extreme', label: '256×144' }
                     ] as const
                   ).map((item) => (
                     <button
@@ -4904,6 +5638,62 @@ export default function App() {
                 </div>
               </div>
 
+              {/* GPU Super Resolution & Resolution Profile Quick Control */}
+              <div className="p-3.5 rounded-2xl flex flex-col gap-2" style={{ background: 'var(--surface-elevated)' }}>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-bold">GPU Супер-разрешение (Super Resolution)</span>
+                  <span className="text-[11px] font-mono-code font-bold" style={{ color: 'var(--text-sub)' }}>
+                    {upscaleEnabled ? `${upscaleModeLabel} • ${upscaleFactorLabel}` : 'Выключен'}
+                  </span>
+                </div>
+                <div className="rex-segmented">
+                  {(
+                    [
+                      { id: 'gsr', label: 'GSR' },
+                      { id: 'fsr', label: 'FSR' },
+                      { id: 'anime4k', label: 'Anime4K' },
+                      { id: 'cinema', label: 'Кино' }
+                    ] as const
+                  ).map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => {
+                        setUpscaleMode(item.id);
+                        setUpscaleEnabled(true);
+                        forceRedrawRef.current = true;
+                      }}
+                      className={`rex-seg-btn ${upscaleEnabled && upscaleMode === item.id ? 'active' : ''}`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="rex-segmented">
+                  {(
+                    [
+                      { id: 'auto', label: `Авто (${effectiveUpscaleFactor}x)` },
+                      { id: 1.5, label: 'FHD+ 1.5x' },
+                      { id: 2.0, label: 'QHD 2K' },
+                      { id: 4.0, label: '4K UHD' }
+                    ] as const
+                  ).map((item) => (
+                    <button
+                      key={String(item.id)}
+                      type="button"
+                      onClick={() => {
+                        setUpscaleFactor(item.id);
+                        setUpscaleEnabled(true);
+                        forceRedrawRef.current = true;
+                      }}
+                      className={`rex-seg-btn ${upscaleEnabled && upscaleFactor === item.id ? 'active' : ''}`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="p-3.5 rounded-2xl flex items-center justify-between gap-3" style={{ background: 'var(--surface-elevated)' }}>
                 <div className="min-w-0">
                   <div className="text-xs font-bold truncate">
@@ -4911,7 +5701,7 @@ export default function App() {
                   </div>
                   <div className="text-[11px] font-mono-code mt-0.5 truncate" style={{ color: 'var(--text-sub)' }}>
                     {isAdrenoActive
-                      ? `${detectedGpuInfo.gmemCacheLabel} • Активен`
+                      ? `${detectedGpuInfo.gmemCacheLabel} • Профиль FP16 активен`
                       : 'Стандартный профиль WebGL'}
                   </div>
                 </div>
@@ -5009,7 +5799,9 @@ export default function App() {
                       <div className="text-[11px] font-mono-code truncate" style={{ color: 'var(--text-sub)' }}>
                         {preset.settings.targetFps || 60} FPS •{' '}
                         {(preset.settings.upscaleMode || 'gsr').toUpperCase()}{' '}
-                        {preset.settings.upscaleFactor || 2.0}x
+                        {preset.settings.upscaleFactor === 'auto'
+                          ? 'Авто'
+                          : `${preset.settings.upscaleFactor || 2.0}x`}
                       </div>
                     </div>
                     <button
@@ -5220,7 +6012,7 @@ export default function App() {
                       <div className="rex-serif font-bold text-base">MEMC, Апскейлер, Adreno и HDR10</div>
                       <div className="text-xs mt-0.5" style={{ color: 'var(--text-sub)' }}>
                         {interpEnabled ? `${effectiveTargetFps} FPS` : 'MEMC выкл'} •{' '}
-                        {upscaleEnabled ? `${upscaleModeLabel} ${upscaleFactor}x` : 'Апскейл выкл'} •{' '}
+                        {upscaleEnabled ? `${upscaleModeLabel} (${upscaleFactorLabel})` : 'Апскейл выкл'} •{' '}
                         {isAdrenoActive ? 'Adreno GMEM' : 'Стандарт GPU'} •{' '}
                         {hdrEnabled ? 'HDR10' : 'SDR'}
                       </div>
@@ -5317,6 +6109,23 @@ export default function App() {
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
+              {(() => {
+                const activeVidObj = userVideos.find(
+                  (v) => v.id === lastActiveVideoId || v.title === activeVideoTitle
+                );
+                return activeVidObj?.thumbnailUrl ? (
+                  <div
+                    className="w-12 h-8 rounded-lg overflow-hidden shrink-0 border hidden sm:block"
+                    style={{ borderColor: 'var(--border-soft)', background: '#000' }}
+                  >
+                    <img
+                      src={activeVidObj.thumbnailUrl}
+                      alt={activeVideoTitle}
+                      className="w-full h-full object-cover block"
+                    />
+                  </div>
+                ) : null;
+              })()}
               <div className="min-w-0">
                 <h2 className="rex-serif text-base font-bold truncate max-w-[180px] sm:max-w-[320px]">
                   {activeVideoTitle}
@@ -5359,7 +6168,7 @@ export default function App() {
                   )}
                   {upscaleEnabled && (
                     <span className="text-xs font-mono-code" style={{ color: 'var(--text-sub)' }}>
-                      • {upscaleModeLabel} {upscaleFactor}x
+                      • {upscaleModeLabel} • {upscaleFactorLabel}
                     </span>
                   )}
                   {isAdrenoActive && (
@@ -5401,8 +6210,8 @@ export default function App() {
                     const next = !prev;
                     showToast(
                       next
-                        ? `Апскейлер ${upscaleModeLabel} ${upscaleFactor}x включён`
-                        : 'Апскейлер выключен'
+                        ? `${upscaleModeLabel} (${upscaleFactorLabel}) включён`
+                        : 'GPU Апскейлер выключен'
                     );
                     return next;
                   });
@@ -5412,10 +6221,13 @@ export default function App() {
                   background: upscaleEnabled ? 'var(--accent-bg)' : 'var(--surface-pill)',
                   color: upscaleEnabled ? 'var(--accent-text)' : 'var(--text-main)'
                 }}
-                title="Включить / выключить GPU Апскейлер видео"
+                title="Включить / выключить GPU Super Resolution"
               >
                 <Zap className="w-3.5 h-3.5" />
-                <span>{upscaleModeLabel} {upscaleFactor}x</span>
+                <span>
+                  {upscaleModeLabel}{' '}
+                  {upscaleFactor === 'auto' ? `Авто (${effectiveUpscaleFactor}x)` : `${upscaleFactor}x`}
+                </span>
               </button>
 
               <button
@@ -5534,7 +6346,7 @@ export default function App() {
                 className="px-3 py-1.5 rounded-full text-xs font-semibold transition cursor-pointer"
                 style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
               >
-                MEMC
+                MEMC / UP
               </button>
             </div>
           )}
@@ -5576,6 +6388,10 @@ export default function App() {
             }`}
             style={{
               zIndex: 1,
+              opacity: isVideoFallbackActive ? 1 : 0.001,
+              filter: isVideoFallbackActive
+                ? `brightness(${videoBrightness}) ${monochromeFilter ? 'grayscale(1)' : ''}`
+                : undefined
             }}
             onPlay={() => {
               setIsPlaying(true);
@@ -5602,18 +6418,29 @@ export default function App() {
               if (videoRef.current) {
                 const t = videoRef.current.currentTime || 0;
                 if (isVideoFallbackActive) {
-                  currentTimeRef.current = t;
+                  if (!isScrubbingRef.current) {
+                    currentTimeRef.current = t;
+                  }
                   if (timecodeDisplayRef.current) {
                     timecodeDisplayRef.current.textContent = formatTime(t);
                   }
                   if (fsTimecodeDisplayRef.current) {
                     fsTimecodeDisplayRef.current.textContent = formatTime(t);
                   }
-                  if (scrubberInputRef.current) {
+                  if (scrubberInputRef.current && !isScrubbingRef.current) {
                     scrubberInputRef.current.value = String(t);
                   }
-                  if (fsScrubberInputRef.current) {
+                  if (fsScrubberInputRef.current && !isScrubbingRef.current) {
                     fsScrubberInputRef.current.value = String(t);
+                  }
+                  if (rememberPosition && t > 1) {
+                    if (activeVideoKeyRef.current) {
+                      savedPositionsRef.current[activeVideoKeyRef.current] = t;
+                    }
+                    if (activeVideoUrlRef.current) {
+                      savedPositionsRef.current[activeVideoUrlRef.current] = t;
+                    }
+                    saveSavedPositions(savedPositionsRef.current);
                   }
 
                   // Synchronize subtitle cues during Video Fallback mode
@@ -5656,7 +6483,7 @@ export default function App() {
                 ОРИГИНАЛ
               </span>
               <span className="px-2.5 py-1 rounded-lg bg-zinc-950/85 text-white font-mono-code text-[11px] font-bold border border-white/15">
-                {upscaleEnabled ? `${upscaleMode.toUpperCase()} ${upscaleFactor}x • ` : ''}
+                {upscaleEnabled ? `${upscaleModeLabel} ${effectiveUpscaleFactor}x • ` : ''}
                 MEMC {effectiveTargetFps} FPS {hdrEnabled ? '• HDR' : ''}
               </span>
             </div>
@@ -5703,7 +6530,7 @@ export default function App() {
                     <Sparkles className="w-3 h-3 text-amber-300" />
                     <span>
                       {interpMode === 'optical'
-                        ? `Оптич. поток • ${effectiveTargetFps} FPS`
+                        ? `Оптич. поток • ${effectiveTargetFps} FPS${subframeCascadeEnabled ? ` • Суб-FBO ${effectiveSubframeCascadeMult}x` : ''}`
                         : `Смешивание • ${effectiveTargetFps} FPS`}
                     </span>
                   </span>
@@ -5714,7 +6541,7 @@ export default function App() {
                 )}
                 {upscaleEnabled && (
                   <span className="px-2.5 py-0.5 rounded-full bg-emerald-400 text-black font-mono-code text-[11px] font-bold shadow">
-                    {upscaleModeLabel} {upscaleFactor}x
+                    {upscaleModeLabel} • {upscaleFactor === 'auto' ? `Авто ${effectiveUpscaleFactor}x` : `${upscaleFactor}x`}
                   </span>
                 )}
                 {isAdrenoActive && (
@@ -5773,10 +6600,10 @@ export default function App() {
                         {videoNativeRes} •{' '}
                         {interpEnabled && interpMode !== 'off'
                           ? interpMode === 'optical'
-                            ? `Оптич. поток ${effectiveTargetFps} FPS`
+                            ? `Оптич. поток ${effectiveTargetFps} FPS${subframeCascadeEnabled ? ` • Суб-FBO ${effectiveSubframeCascadeMult}x` : ''}`
                             : `Смешивание ${effectiveTargetFps} FPS`
                           : 'SDR'}
-                        {upscaleEnabled ? ` • ${upscaleMode.toUpperCase()} ${upscaleFactor}x` : ''}
+                        {upscaleEnabled ? ` • ${upscaleModeLabel} ${effectiveUpscaleFactor}x` : ''}
                         {hdrEnabled ? ' • HDR10' : ''}
                       </div>
                     </div>
@@ -5819,7 +6646,7 @@ export default function App() {
                           : 'bg-white/15 text-white'
                       }`}
                     >
-                      UP {upscaleEnabled ? `${upscaleFactor}x` : 'Выкл'}
+                      {upscaleEnabled ? `${upscaleModeLabel} ${effectiveUpscaleFactor}x` : 'UP Выкл'}
                     </button>
 
                     <button
@@ -5847,7 +6674,7 @@ export default function App() {
                     >
                       {interpEnabled && interpMode !== 'off'
                         ? interpMode === 'optical'
-                          ? `Оптич. ${effectiveTargetFps}`
+                          ? `Оптич. ${effectiveTargetFps}${subframeCascadeEnabled ? ` (${effectiveSubframeCascadeMult}x)` : ''}`
                           : `Смесь ${effectiveTargetFps}`
                         : 'MEMC Выкл'}
                     </button>
@@ -5912,8 +6739,8 @@ export default function App() {
                 >
                   <div className="flex items-center justify-between border-b border-white/10 pb-2">
                     <span className="rex-serif font-bold text-sm">
-                      {fsActivePanel === 'upscale' && 'GPU Апскейлер видео (Super Resolution)'}
-                      {fsActivePanel === 'memc' && 'MEMC Интерполяция и HDR10'}
+                      {fsActivePanel === 'upscale' && 'GPU Супер-разрешение (Super Resolution)'}
+                      {fsActivePanel === 'memc' && 'MEMC Интерполяция и Каскад Суб-Кадров'}
                       {fsActivePanel === 'audio' && 'Звук и 5-полосный Эквалайзер'}
                       {fsActivePanel === 'subtitles' && 'Субтитры (.SRT / .VTT)'}
                       {fsActivePanel === 'playlist' && 'Плейлист и выбор видео'}
@@ -5940,7 +6767,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* PANEL 0: GPU VIDEO UPSCALER & SNAPDRAGON GSR */}
+                  {/* PANEL 0: GPU VIDEO UPSCALER */}
                   {fsActivePanel === 'upscale' && (
                     <div className="flex flex-col gap-3 text-xs">
                       <div className="grid grid-cols-5 gap-1 bg-white/10 p-1 rounded-full">
@@ -5964,8 +6791,9 @@ export default function App() {
                                   setUpscaleMode(m.id as 'fsr' | 'gsr' | 'anime4k' | 'cinema');
                                   setUpscaleEnabled(true);
                                 }
+                                forceRedrawRef.current = true;
                               }}
-                              className={`py-1.5 rounded-full font-semibold cursor-pointer transition ${
+                              className={`py-1.5 rounded-full font-semibold cursor-pointer transition whitespace-nowrap text-[11px] ${
                                 isAct ? 'bg-white text-black' : 'text-zinc-300'
                               }`}
                             >
@@ -5981,7 +6809,9 @@ export default function App() {
                             Qualcomm Adreno ({detectedGpuInfo.modelLabel})
                           </div>
                           <div className="text-[11px] text-zinc-300 font-mono-code truncate">
-                            {isAdrenoActive ? detectedGpuInfo.gmemCacheLabel : 'Ускоритель Adreno выключен'}
+                            {isAdrenoActive
+                              ? detectedGpuInfo.gmemCacheLabel
+                              : 'Ускоритель Adreno выключен'}
                           </div>
                         </div>
                         <button
@@ -5995,20 +6825,22 @@ export default function App() {
                         </button>
                       </div>
 
-                      <div className="grid grid-cols-3 gap-1.5 bg-white/10 p-1 rounded-full">
+                      <div className="grid grid-cols-4 gap-1 bg-white/10 p-1 rounded-full">
                         {([
-                          { factor: 1.5 as const, label: '1.5x (810p)' },
-                          { factor: 2.0 as const, label: '2.0x (1080p)' },
-                          { factor: 4.0 as const, label: '4.0x (4K UHD)' }
+                          { factor: 'auto' as const, label: `Авто (${effectiveUpscaleFactor}x)` },
+                          { factor: 1.5 as const, label: 'FHD+ 1.5x' },
+                          { factor: 2.0 as const, label: 'QHD 2K' },
+                          { factor: 4.0 as const, label: '4K UHD' }
                         ]).map((item) => (
                           <button
-                            key={item.factor}
+                            key={String(item.factor)}
                             type="button"
                             onClick={() => {
                               setUpscaleFactor(item.factor);
                               setUpscaleEnabled(true);
+                              forceRedrawRef.current = true;
                             }}
-                            className={`py-1.5 rounded-full font-mono-code font-bold cursor-pointer transition ${
+                            className={`py-1.5 rounded-full font-mono-code font-bold cursor-pointer transition whitespace-nowrap text-[11px] ${
                               upscaleEnabled && upscaleFactor === item.factor
                                 ? 'bg-emerald-400 text-black'
                                 : 'text-zinc-300'
@@ -6021,7 +6853,9 @@ export default function App() {
 
                       <div>
                         <div className="flex justify-between mb-1">
-                          <span className="text-zinc-300">Резкость и детализация контуров (CAS)</span>
+                          <span className="text-zinc-300">
+                            Резкость и детализация контуров (CAS)
+                          </span>
                           <span className="font-mono-code font-bold">
                             {Math.round(upscaleSharpness * 100)}%
                           </span>
@@ -6035,6 +6869,7 @@ export default function App() {
                           onChange={(e) => {
                             setUpscaleSharpness(parseFloat(e.target.value));
                             if (!upscaleEnabled) setUpscaleEnabled(true);
+                            forceRedrawRef.current = true;
                           }}
                           className="rex-slider"
                         />
@@ -6042,7 +6877,9 @@ export default function App() {
 
                       <div>
                         <div className="flex justify-between mb-1">
-                          <span className="text-zinc-300">Подавление шума и артефактов сжатия</span>
+                          <span className="text-zinc-300">
+                            Подавление шума и артефактов сжатия
+                          </span>
                           <span className="font-mono-code font-bold">
                             {Math.round(upscaleDenoise * 100)}%
                           </span>
@@ -6056,6 +6893,7 @@ export default function App() {
                           onChange={(e) => {
                             setUpscaleDenoise(parseFloat(e.target.value));
                             if (!upscaleEnabled) setUpscaleEnabled(true);
+                            forceRedrawRef.current = true;
                           }}
                           className="rex-slider"
                         />
@@ -6137,6 +6975,92 @@ export default function App() {
                         </div>
                       </div>
 
+                      {/* Secondary Sub-Frame Cascade FBO inside Fullscreen MEMC Panel */}
+                      <div className="p-2.5 rounded-2xl bg-white/10 border border-white/10 flex flex-col gap-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div>
+                            <div className="font-bold text-white">
+                              Вторичные суб-кадры (Каскад FBO)
+                            </div>
+                            <div className="text-[10px] text-zinc-300 font-mono-code">
+                              Генерация от промежуточного I_0.5 • Сдвиг векторов ×0.5
+                            </div>
+                          </div>
+                          <label className="inline-flex items-center gap-1.5 cursor-pointer shrink-0">
+                            <input
+                              type="checkbox"
+                              checked={subframeCascadeEnabled}
+                              onChange={(e) => {
+                                setSubframeCascadeEnabled(e.target.checked);
+                                if (e.target.checked && (!interpEnabled || interpMode === 'off')) {
+                                  setInterpEnabled(true);
+                                  setInterpMode('optical');
+                                }
+                                forceRedrawRef.current = true;
+                              }}
+                              className="w-4 h-4 accent-sky-400 rounded"
+                            />
+                            <span className="font-mono-code font-bold text-sky-300">
+                              {subframeCascadeEnabled ? `${effectiveSubframeCascadeMult}x` : 'Выкл'}
+                            </span>
+                          </label>
+                        </div>
+
+                        <div className="grid grid-cols-4 gap-1 bg-black/30 p-1 rounded-full text-[11px]">
+                          {(
+                            [
+                              { id: 'auto', label: `Авто (${effectiveSubframeCascadeMult}x)` },
+                              { id: '2x', label: '2x Суб' },
+                              { id: '3x', label: '3x Суб' },
+                              { id: '4x', label: '4x Ультра' }
+                            ] as const
+                          ).map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() => {
+                                setSubframeCascadeMode(item.id);
+                                setSubframeCascadeEnabled(true);
+                                if (!interpEnabled || interpMode === 'off') {
+                                  setInterpEnabled(true);
+                                  setInterpMode('optical');
+                                }
+                                forceRedrawRef.current = true;
+                              }}
+                              className={`py-1 rounded-full font-mono-code font-bold cursor-pointer transition whitespace-nowrap text-center ${
+                                subframeCascadeEnabled && subframeCascadeMode === item.id
+                                  ? 'bg-sky-400 text-black'
+                                  : 'text-zinc-300'
+                              }`}
+                            >
+                              {item.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        <div>
+                          <div className="flex justify-between mb-1 text-[11px]">
+                            <span className="text-zinc-300">Когерентность векторов и защита быстрых сцен</span>
+                            <span className="font-mono-code font-bold text-sky-300">
+                              {subframeCoherenceGuard}%
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            step={5}
+                            value={subframeCoherenceGuard}
+                            onChange={(e) => {
+                              setSubframeCoherenceGuard(parseInt(e.target.value, 10));
+                              if (!subframeCascadeEnabled) setSubframeCascadeEnabled(true);
+                              forceRedrawRef.current = true;
+                            }}
+                            className="rex-slider"
+                          />
+                        </div>
+                      </div>
+
                       <div>
                         <div className="flex justify-between mb-1">
                           <span className="text-zinc-300">HDR10 Тонмаппинг</span>
@@ -6185,6 +7109,48 @@ export default function App() {
                         />
                       </div>
 
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-zinc-300">Буфер потока FBO (5-Lvl Pyramid)</span>
+                          <span className="font-mono-code font-bold text-emerald-300">
+                            {flowScaleMode === 'extreme'
+                              ? '256×144 Макс'
+                              : flowScaleMode === 'ultra'
+                              ? '128×72 Ультра'
+                              : flowScaleMode === 'balanced'
+                              ? '96×54 Баланс'
+                              : flowScaleMode === 'performance'
+                              ? '64×36 Быстрый'
+                              : 'Авто'}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-5 gap-1 bg-white/10 p-1 rounded-full text-[10px]">
+                          {(
+                            [
+                              { id: 'auto', label: 'Авто' },
+                              { id: 'performance', label: '64×36' },
+                              { id: 'balanced', label: '96×54' },
+                              { id: 'ultra', label: '128×72' },
+                              { id: 'extreme', label: '256×144' }
+                            ] as const
+                          ).map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() => {
+                                setFlowScaleMode(item.id);
+                                forceRedrawRef.current = true;
+                              }}
+                              className={`py-1.5 rounded-full font-mono-code font-bold cursor-pointer transition text-center ${
+                                flowScaleMode === item.id ? 'bg-white text-black' : 'text-zinc-300'
+                              }`}
+                            >
+                              {item.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
                       <div className="grid grid-cols-2 gap-3">
                         <div>
                           <div className="flex justify-between mb-1">
@@ -6194,7 +7160,7 @@ export default function App() {
                           <input
                             type="range"
                             min={4}
-                            max={32}
+                            max={48}
                             step={1}
                             value={motionScale}
                             onChange={(e) => {
@@ -6418,15 +7384,26 @@ export default function App() {
                             <div
                               key={item.id}
                               onClick={() => playPlaylistIndex(idx)}
-                              className={`p-2 rounded-xl flex items-center justify-between cursor-pointer ${
+                              className={`p-2 rounded-xl flex items-center justify-between gap-2 cursor-pointer ${
                                 idx === activePlaylistIndex
                                   ? 'bg-white text-black font-bold'
                                   : 'bg-white/10 text-white'
                               }`}
                             >
-                              <span className="truncate pr-2">
-                                {idx + 1}. {item.title}
-                              </span>
+                              <div className="flex items-center gap-2 min-w-0">
+                                {item.thumbnailUrl ? (
+                                  <img
+                                    src={item.thumbnailUrl}
+                                    alt={item.title}
+                                    className="w-10 h-6 rounded object-cover shrink-0 bg-black/40"
+                                  />
+                                ) : (
+                                  <FileVideo className="w-4 h-4 shrink-0 opacity-75" />
+                                )}
+                                <span className="truncate">
+                                  {idx + 1}. {item.title}
+                                </span>
+                              </div>
                               <span className="font-mono-code text-[10px] shrink-0">{item.size}</span>
                             </div>
                           ))
@@ -6612,6 +7589,12 @@ export default function App() {
                       isScrubbingRef.current = false;
                       revealFsControls();
                     }}
+                    onPointerCancel={() => {
+                      isScrubbingRef.current = false;
+                    }}
+                    onBlur={() => {
+                      isScrubbingRef.current = false;
+                    }}
                     onChange={(e) => {
                       const val = parseFloat(e.target.value);
                       seekToTime(val);
@@ -6692,7 +7675,10 @@ export default function App() {
                       onClick={() => {
                         setIsPlaying(false);
                         if (videoRef.current) videoRef.current.pause();
-                        seekToTime(currentTimeRef.current - 1 / 24);
+                        const stepSec = isDemoTestActive
+                          ? 1 / 24
+                          : Math.max(1 / 120, Math.min(1 / 12, (estimatedFrameIntervalMsRef.current || 41.667) / 1000));
+                        seekToTime(currentTimeRef.current - stepSec);
                       }}
                       className="px-2.5 py-1.5 rounded-full bg-white/15 text-white text-xs font-mono-code cursor-pointer"
                       title="Кадр назад"
@@ -6705,7 +7691,10 @@ export default function App() {
                       onClick={() => {
                         setIsPlaying(false);
                         if (videoRef.current) videoRef.current.pause();
-                        seekToTime(currentTimeRef.current + 1 / 24);
+                        const stepSec = isDemoTestActive
+                          ? 1 / 24
+                          : Math.max(1 / 120, Math.min(1 / 12, (estimatedFrameIntervalMsRef.current || 41.667) / 1000));
+                        seekToTime(currentTimeRef.current + stepSec);
                       }}
                       className="px-2.5 py-1.5 rounded-full bg-white/15 text-white text-xs font-mono-code cursor-pointer"
                       title="Кадр вперёд"
@@ -6839,19 +7828,19 @@ export default function App() {
 
           {/* Hold 2.0x Speed Feedback Badge */}
           {seekFeedback && !swipeHud && (
-            <div className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 px-4 py-2 rounded-full bg-zinc-950/90 text-white font-mono-code text-sm font-bold border border-white/20 z-40">
+            <div className="pointer-events-none absolute top-12 left-1/2 -translate-x-1/2 px-4 py-1.5 rounded-full bg-black/80 text-white text-xs font-mono-code font-bold border border-white/20 z-30">
               {seekFeedback}
             </div>
           )}
         </div>
 
-        {/* Transport & Timeline Scrubber Card */}
+        {/* Transport Scrubber & Controls */}
         <div
           className="mt-3 p-4 rounded-3xl flex flex-col gap-3"
           style={{ background: 'var(--surface-card)', border: '1px solid var(--border-soft)' }}
         >
-          <div>
-            <div className="flex items-center justify-between text-xs font-mono-code mb-1.5" style={{ color: 'var(--text-sub)' }}>
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between text-xs font-mono-code" style={{ color: 'var(--text-sub)' }}>
               <span ref={timecodeDisplayRef}>{formatTime(currentTime)}</span>
               <div className="flex items-center gap-2">
                 <span>{formatTime(duration)}</span>
@@ -6883,6 +7872,12 @@ export default function App() {
                 isScrubbingRef.current = true;
               }}
               onPointerUp={() => {
+                isScrubbingRef.current = false;
+              }}
+              onPointerCancel={() => {
+                isScrubbingRef.current = false;
+              }}
+              onBlur={() => {
                 isScrubbingRef.current = false;
               }}
               onChange={(e) => {
@@ -6951,7 +7946,10 @@ export default function App() {
                     onClick={() => {
                       setIsPlaying(false);
                       if (videoRef.current) videoRef.current.pause();
-                      seekToTime(currentTimeRef.current - 1 / 24);
+                      const stepSec = isDemoTestActive
+                        ? 1 / 24
+                        : Math.max(1 / 120, Math.min(1 / 12, (estimatedFrameIntervalMsRef.current || 41.667) / 1000));
+                      seekToTime(currentTimeRef.current - stepSec);
                     }}
                     className="p-3 rounded-2xl transition cursor-pointer hover:opacity-85"
                     style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
@@ -6964,7 +7962,10 @@ export default function App() {
                     onClick={() => {
                       setIsPlaying(false);
                       if (videoRef.current) videoRef.current.pause();
-                      seekToTime(currentTimeRef.current + 1 / 24);
+                      const stepSec = isDemoTestActive
+                        ? 1 / 24
+                        : Math.max(1 / 120, Math.min(1 / 12, (estimatedFrameIntervalMsRef.current || 41.667) / 1000));
+                      seekToTime(currentTimeRef.current + stepSec);
                     }}
                     className="p-3 rounded-2xl transition cursor-pointer hover:opacity-85"
                     style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
@@ -7105,6 +8106,17 @@ export default function App() {
                   >
                     <div className="flex items-center gap-2.5 min-w-0">
                       <span className="font-mono-code text-xs font-bold opacity-75">{idx + 1}.</span>
+                      {item.thumbnailUrl ? (
+                        <img
+                          src={item.thumbnailUrl}
+                          alt={item.title}
+                          className="w-12 h-7 rounded-lg object-cover shrink-0 bg-black/30"
+                        />
+                      ) : (
+                        <div className="w-8 h-7 rounded-lg flex items-center justify-center shrink-0 bg-black/20">
+                          <FileVideo className="w-4 h-4 opacity-75" />
+                        </div>
+                      )}
                       <div className="truncate">
                         <div className="text-xs font-bold truncate">{item.title}</div>
                         <div className="text-[11px] opacity-75 font-mono-code">{item.size}</div>
@@ -7135,7 +8147,7 @@ export default function App() {
           >
             <div className="flex items-center gap-2 flex-wrap min-w-0">
               <span className="rex-serif font-bold text-sm">
-                Видеопроцессор (Adreno • MEMC • Апскейлер • HDR)
+                Видеопроцессор (Adreno • MEMC • Super Res • HDR)
               </span>
               <div className="flex items-center gap-1 flex-wrap">
                 {isAdrenoActive && (
@@ -7150,14 +8162,16 @@ export default function App() {
                   className="px-2 py-0.5 rounded-full text-[11px] font-mono-code font-bold"
                   style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
                 >
-                  {interpEnabled && interpMode !== 'off' ? `${effectiveTargetFps} FPS` : 'MEMC Выкл'}
+                  {interpEnabled && interpMode !== 'off'
+                    ? `${effectiveTargetFps} FPS${interpMode === 'optical' && subframeCascadeEnabled ? ` • Суб-FBO ${effectiveSubframeCascadeMult}x` : ''}`
+                    : 'MEMC Выкл'}
                 </span>
                 {upscaleEnabled && (
                   <span
                     className="px-2 py-0.5 rounded-full text-[11px] font-mono-code font-bold"
                     style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
                   >
-                    {upscaleModeLabel} {upscaleFactor}x
+                    {upscaleModeLabel} • {upscaleFactor === 'auto' ? `Авто (${effectiveUpscaleFactor}x)` : upscaleFactorLabel}
                   </span>
                 )}
                 {hdrEnabled && (
@@ -7390,6 +8404,147 @@ export default function App() {
                         ))}
                       </div>
 
+                      {/* Secondary Sub-Frame Cascade FBO (Hierarchical Sub-Frame MEMC) */}
+                      <div
+                        className="p-2.5 rounded-2xl flex flex-col gap-2"
+                        style={{
+                          background: 'var(--surface-elevated)',
+                          border: '1px solid var(--border-soft)'
+                        }}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="text-xs font-bold truncate">
+                              Вторичные суб-кадры (Каскад FBO)
+                            </div>
+                            <div
+                              className="text-[10px] font-mono-code truncate"
+                              style={{ color: 'var(--text-sub)' }}
+                            >
+                              Генерация от промежуточного I_0.5 • Сдвиг векторов ×0.5
+                            </div>
+                          </div>
+                          <label className="inline-flex items-center gap-1.5 text-xs font-semibold cursor-pointer shrink-0">
+                            <input
+                              type="checkbox"
+                              checked={subframeCascadeEnabled}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
+                                setSubframeCascadeEnabled(checked);
+                                if (checked && (!interpEnabled || interpMode === 'off')) {
+                                  setInterpEnabled(true);
+                                  setInterpMode('optical');
+                                }
+                                forceRedrawRef.current = true;
+                              }}
+                              className="w-4 h-4 accent-zinc-900 rounded"
+                            />
+                            <span className="font-mono-code font-bold">
+                              {subframeCascadeEnabled ? subframeCascadeLabel : 'Выкл'}
+                            </span>
+                          </label>
+                        </div>
+
+                        <div className="rex-segmented">
+                          {(
+                            [
+                              { id: 'auto', label: `Авто (${effectiveSubframeCascadeMult}x)` },
+                              { id: '2x', label: '2x Суб' },
+                              { id: '3x', label: '3x Суб' },
+                              { id: '4x', label: '4x Ультра' }
+                            ] as const
+                          ).map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() => {
+                                setSubframeCascadeMode(item.id);
+                                setSubframeCascadeEnabled(true);
+                                if (!interpEnabled || interpMode === 'off') {
+                                  setInterpEnabled(true);
+                                  setInterpMode('optical');
+                                }
+                                forceRedrawRef.current = true;
+                              }}
+                              className={`rex-seg-btn ${
+                                subframeCascadeEnabled && subframeCascadeMode === item.id ? 'active' : ''
+                              }`}
+                            >
+                              {item.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        <div>
+                          <div className="flex items-center justify-between text-[11px] mb-1">
+                            <span style={{ color: 'var(--text-sub)' }}>
+                              Когерентность векторов (защита быстрых сцен)
+                            </span>
+                            <span className="font-mono-code font-bold">{subframeCoherenceGuard}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            step={5}
+                            value={subframeCoherenceGuard}
+                            onChange={(e) => {
+                              setSubframeCoherenceGuard(parseInt(e.target.value, 10));
+                              if (!subframeCascadeEnabled) setSubframeCascadeEnabled(true);
+                              forceRedrawRef.current = true;
+                            }}
+                            className="rex-slider"
+                          />
+                        </div>
+                      </div>
+
+                      {/* 5-Level Pyramid FBO Flow Scale Selector Directly Under Player */}
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="font-semibold" style={{ color: 'var(--text-sub)' }}>
+                            Плотность потока FBO (5-Lvl Pyramid + Mesh 160×90)
+                          </span>
+                          <span className="font-mono-code font-bold" style={{ color: 'var(--text-main)' }}>
+                            {flowScaleMode === 'extreme'
+                              ? 'Максимум 256×144'
+                              : flowScaleMode === 'ultra'
+                              ? 'Ультра 128×72'
+                              : flowScaleMode === 'balanced'
+                              ? 'Баланс 96×54'
+                              : flowScaleMode === 'performance'
+                              ? 'Быстрый 64×36'
+                              : 'Авто (5-Lvl)'}
+                          </span>
+                        </div>
+                        <div className="rex-segmented">
+                          {(
+                            [
+                              { id: 'auto', label: 'Авто' },
+                              { id: 'performance', label: '64×36' },
+                              { id: 'balanced', label: '96×54' },
+                              { id: 'ultra', label: '128×72' },
+                              { id: 'extreme', label: '256×144' }
+                            ] as const
+                          ).map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() => {
+                                setFlowScaleMode(item.id);
+                                if (!interpEnabled || interpMode === 'off') {
+                                  setInterpEnabled(true);
+                                  setInterpMode('optical');
+                                }
+                                forceRedrawRef.current = true;
+                              }}
+                              className={`rex-seg-btn ${flowScaleMode === item.id ? 'active' : ''}`}
+                            >
+                              {item.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
                       {/* Interactive Sub-Frame Synthesis Inspector & Live Counter */}
                       <div
                         className="p-3 rounded-2xl flex flex-col gap-2"
@@ -7401,7 +8556,7 @@ export default function App() {
                         <div className="flex items-center justify-between gap-2 flex-wrap">
                           <div className="flex items-center gap-1.5 text-xs font-bold">
                             <Sparkles className="w-3.5 h-3.5 text-purple-500 shrink-0" />
-                            <span>Синтез промежуточных кадров</span>
+                            <span>Синтез промежуточных и вторичных суб-кадров</span>
                           </div>
                           <div className="flex items-center gap-1.5 font-mono-code text-[11px]">
                             <span
@@ -7429,7 +8584,7 @@ export default function App() {
                             type="range"
                             min={0}
                             max={1}
-                            step={0.02}
+                            step={0.01}
                             value={manualSubframePhase ?? 0.5}
                             onChange={(e) => {
                               const val = parseFloat(e.target.value);
@@ -7441,7 +8596,7 @@ export default function App() {
                               forceRedrawRef.current = true;
                             }}
                             className="rex-slider flex-1"
-                            title="Вручную сдвиньте фазу α между кадрами T-1 и T, чтобы увидеть работу оптического потока"
+                            title="Вручную сдвиньте фазу α между кадрами T-1, I_0.5 и T, чтобы увидеть работу каскада"
                           />
                           <span className="text-[11px] font-mono-code shrink-0" style={{ color: 'var(--text-sub)' }}>
                             T
@@ -7453,7 +8608,9 @@ export default function App() {
                             {[
                               { val: null, label: 'Авто' },
                               { val: 0.0, label: '0% (T-1)' },
-                              { val: 0.5, label: '50% (Синтез)' },
+                              { val: 0.25, label: '25% (Суб 1)' },
+                              { val: 0.5, label: '50% (Опорный)' },
+                              { val: 0.75, label: '75% (Суб 2)' },
                               { val: 1.0, label: '100% (T)' }
                             ].map((btn) => {
                               const isSelected = manualSubframePhase === btn.val;
@@ -7465,7 +8622,7 @@ export default function App() {
                                     setManualSubframePhase(btn.val);
                                     forceRedrawRef.current = true;
                                   }}
-                                  className="px-2 py-1 rounded-lg text-[10px] font-mono-code font-bold cursor-pointer transition"
+                                  className="px-2 py-1 rounded-lg text-[10px] font-mono-code font-bold cursor-pointer transition whitespace-nowrap"
                                   style={{
                                     background: isSelected ? 'var(--accent-bg)' : 'var(--surface-pill)',
                                     color: isSelected ? 'var(--accent-text)' : 'var(--text-main)'
@@ -7561,7 +8718,7 @@ export default function App() {
                       className="flex items-center gap-1.5 rex-serif font-bold text-sm cursor-pointer"
                       style={{ color: 'var(--text-main)' }}
                     >
-                      <span>Апскейлер (Super Resolution)</span>
+                      <span>GPU Апскейлер (Super Resolution)</span>
                       {collapsedSections.upscale ? (
                         <ChevronDown className="w-4 h-4 opacity-70" />
                       ) : (
@@ -7572,11 +8729,14 @@ export default function App() {
                       <input
                         type="checkbox"
                         checked={upscaleEnabled}
-                        onChange={(e) => setUpscaleEnabled(e.target.checked)}
+                        onChange={(e) => {
+                          setUpscaleEnabled(e.target.checked);
+                          forceRedrawRef.current = true;
+                        }}
                         className="w-4 h-4 accent-zinc-900 rounded"
                       />
                       <span className="font-mono-code">
-                        {upscaleEnabled ? `${upscaleModeLabel} ${upscaleFactor}x` : 'Выкл'}
+                        {upscaleEnabled ? `${upscaleModeLabel} • ${upscaleFactorLabel}` : 'Выкл'}
                       </span>
                     </label>
                   </div>
@@ -7586,8 +8746,8 @@ export default function App() {
                       <div className="rex-segmented">
                         {(
                           [
-                            { id: 'gsr', label: 'GSR (Adreno)' },
-                            { id: 'fsr', label: 'FSR / CAS' },
+                            { id: 'gsr', label: 'GSR' },
+                            { id: 'fsr', label: 'FSR' },
                             { id: 'anime4k', label: 'Anime4K' },
                             { id: 'cinema', label: 'Кино' }
                           ] as const
@@ -7598,6 +8758,7 @@ export default function App() {
                             onClick={() => {
                               setUpscaleMode(m.id);
                               setUpscaleEnabled(true);
+                              forceRedrawRef.current = true;
                             }}
                             className={`rex-seg-btn ${upscaleEnabled && upscaleMode === m.id ? 'active' : ''}`}
                           >
@@ -7607,17 +8768,25 @@ export default function App() {
                       </div>
 
                       <div className="rex-segmented">
-                        {([1.5, 2.0, 4.0] as const).map((factor) => (
+                        {(
+                          [
+                            { factor: 'auto' as const, label: `Авто (${effectiveUpscaleFactor}x)` },
+                            { factor: 1.5 as const, label: 'FHD+ 1.5x' },
+                            { factor: 2.0 as const, label: 'QHD 2K' },
+                            { factor: 4.0 as const, label: '4K UHD' }
+                          ]
+                        ).map((item) => (
                           <button
-                            key={factor}
+                            key={String(item.factor)}
                             type="button"
                             onClick={() => {
-                              setUpscaleFactor(factor);
+                              setUpscaleFactor(item.factor);
                               setUpscaleEnabled(true);
+                              forceRedrawRef.current = true;
                             }}
-                            className={`rex-seg-btn ${upscaleEnabled && upscaleFactor === factor ? 'active' : ''}`}
+                            className={`rex-seg-btn ${upscaleEnabled && upscaleFactor === item.factor ? 'active' : ''}`}
                           >
-                            {factor === 1.5 ? '1.5x HD+' : factor === 2.0 ? '2.0x FHD' : '4.0x 4K UHD'}
+                            {item.label}
                           </button>
                         ))}
                       </div>
@@ -7650,7 +8819,9 @@ export default function App() {
                   <>
                     <div>
                       <div className="flex items-center justify-between text-xs mb-1">
-                        <span style={{ color: 'var(--text-sub)' }}>Резкость апскейлера (CAS)</span>
+                        <span style={{ color: 'var(--text-sub)' }}>
+                          Резкость апскейлера (CAS)
+                        </span>
                         <span className="font-mono-code font-bold">{Math.round(upscaleSharpness * 100)}%</span>
                       </div>
                       <input
@@ -7670,7 +8841,9 @@ export default function App() {
 
                     <div>
                       <div className="flex items-center justify-between text-xs mb-1">
-                        <span style={{ color: 'var(--text-sub)' }}>Шумоподавление (De-block)</span>
+                        <span style={{ color: 'var(--text-sub)' }}>
+                          Шумоподавление (De-block)
+                        </span>
                         <span className="font-mono-code font-bold">{Math.round(upscaleDenoise * 100)}%</span>
                       </div>
                       <input
@@ -7716,7 +8889,7 @@ export default function App() {
                         <input
                           type="range"
                           min={4}
-                          max={32}
+                          max={48}
                           step={1}
                           value={motionScale}
                           onChange={(e) => {
@@ -7861,9 +9034,22 @@ export default function App() {
           className={`nav-tab ${activeTab === 'home' && activeScreen === 'main' ? 'active' : ''}`}
         >
           <div className="nav-pill-wrap">
-            <Play className="w-5 h-5 fill-current" />
+            <FileVideo className="w-5 h-5" />
           </div>
           <span className="rex-serif text-xs font-bold">Главная</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setActiveScreen('player');
+          }}
+          className={`nav-tab ${activeScreen === 'player' ? 'active' : ''}`}
+        >
+          <div className="nav-pill-wrap">
+            <Play className="w-5 h-5 fill-current" />
+          </div>
+          <span className="rex-serif text-xs font-bold">Плеер</span>
         </button>
 
         <button
@@ -7878,6 +9064,19 @@ export default function App() {
             <User className="w-5 h-5" />
           </div>
           <span className="rex-serif text-xs font-bold">You</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setActiveScreen('settings');
+          }}
+          className={`nav-tab ${activeScreen === 'settings' ? 'active' : ''}`}
+        >
+          <div className="nav-pill-wrap">
+            <SettingsIcon className="w-5 h-5" />
+          </div>
+          <span className="rex-serif text-xs font-bold">Настройки</span>
         </button>
       </nav>
 
@@ -7965,7 +9164,7 @@ export default function App() {
                 {activeModal === 'layout' && 'Расположение элементов'}
                 {activeModal === 'gestures' && 'Жесты и управление'}
                 {activeModal === 'library' && 'Медиа и библиотека'}
-                {activeModal === 'interpolation' && 'Интерполяция кадров (MEMC)'}
+                {activeModal === 'interpolation' && 'Интерполяция (MEMC) и GPU Апскейлер'}
                 {activeModal === 'subtitles' && 'Субтитры (.SRT / .VTT)'}
                 {activeModal === 'audio' && 'Эквалайзер Web Audio API'}
                 {activeModal === 'about' && 'О приложении REX Player'}
@@ -8420,13 +9619,13 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* GPU Upscaler block inside modal */}
+                  {/* GPU Super Resolution Upscaler block inside modal */}
                   <div className="p-3.5 rounded-2xl flex flex-col gap-2.5" style={{ background: 'var(--surface-card)' }}>
                     <div className="flex items-center justify-between">
                       <div>
-                        <div className="font-bold">Апскейлер видео (Super Resolution)</div>
+                        <div className="font-bold">GPU Супер-разрешение (Super Resolution)</div>
                         <div className="text-xs" style={{ color: 'var(--text-sub)' }}>
-                          Реконструкция контуров Snapdragon GSR / FSR / Anime4K / Кино до 4K UHD (3840×2160)
+                          9-Tap направленный апскейлинг с анти-рингингом и подавлением шума сжатия до 4K UHD
                         </div>
                       </div>
                       <input
@@ -8443,8 +9642,8 @@ export default function App() {
                     <div className="rex-segmented">
                       {(
                         [
-                          { id: 'gsr', label: 'GSR (Adreno)' },
-                          { id: 'fsr', label: 'FSR / CAS' },
+                          { id: 'gsr', label: 'GSR' },
+                          { id: 'fsr', label: 'FSR' },
                           { id: 'anime4k', label: 'Anime4K' },
                           { id: 'cinema', label: 'Кино' }
                         ] as const
@@ -8455,6 +9654,7 @@ export default function App() {
                           onClick={() => {
                             setUpscaleMode(m.id);
                             setUpscaleEnabled(true);
+                            forceRedrawRef.current = true;
                           }}
                           className={`rex-seg-btn ${upscaleEnabled && upscaleMode === m.id ? 'active' : ''}`}
                         >
@@ -8464,17 +9664,25 @@ export default function App() {
                     </div>
 
                     <div className="rex-segmented">
-                      {([1.5, 2.0, 4.0] as const).map((factor) => (
+                      {(
+                        [
+                          { factor: 'auto' as const, label: `Авто (${effectiveUpscaleFactor}x)` },
+                          { factor: 1.5 as const, label: 'FHD+ 1.5x' },
+                          { factor: 2.0 as const, label: 'QHD 2K' },
+                          { factor: 4.0 as const, label: '4K UHD' }
+                        ]
+                      ).map((item) => (
                         <button
-                          key={factor}
+                          key={String(item.factor)}
                           type="button"
                           onClick={() => {
-                            setUpscaleFactor(factor);
+                            setUpscaleFactor(item.factor);
                             setUpscaleEnabled(true);
+                            forceRedrawRef.current = true;
                           }}
-                          className={`rex-seg-btn ${upscaleEnabled && upscaleFactor === factor ? 'active' : ''}`}
+                          className={`rex-seg-btn ${upscaleEnabled && upscaleFactor === item.factor ? 'active' : ''}`}
                         >
-                          {factor === 1.5 ? '1.5x HD+' : factor === 2.0 ? '2.0x FHD' : '4.0x 4K UHD'}
+                          {item.label}
                         </button>
                       ))}
                     </div>
@@ -8631,16 +9839,25 @@ export default function App() {
                     <div className="flex items-center justify-between text-xs mb-1">
                       <span className="font-bold">Адаптивный буфер потока (FBO Flow Scale)</span>
                       <span className="text-[11px] font-mono-code font-bold uppercase" style={{ color: 'var(--text-sub)' }}>
-                        {flowScaleMode}
+                        {flowScaleMode === 'extreme'
+                          ? 'EXTREME (256×144)'
+                          : flowScaleMode === 'ultra'
+                          ? 'ULTRA (128×72)'
+                          : flowScaleMode === 'balanced'
+                          ? 'BALANCED (96×54)'
+                          : flowScaleMode === 'performance'
+                          ? 'FAST (64×36)'
+                          : 'AUTO (5-LVL)'}
                       </span>
                     </div>
                     <div className="rex-segmented">
                       {(
                         [
                           { id: 'auto', label: 'Авто' },
-                          { id: 'performance', label: 'Быстрый' },
-                          { id: 'balanced', label: 'Баланс' },
-                          { id: 'ultra', label: 'Ультра' }
+                          { id: 'performance', label: '64×36' },
+                          { id: 'balanced', label: '96×54' },
+                          { id: 'ultra', label: '128×72' },
+                          { id: 'extreme', label: '256×144' }
                         ] as const
                       ).map((m) => (
                         <button
@@ -8657,7 +9874,80 @@ export default function App() {
                       ))}
                     </div>
                     <div className="text-[11px] mt-1.5" style={{ color: 'var(--text-sub)' }}>
-                      Автоматически адаптирует размер сетки оптического потока при высокой нагрузке на GPU
+                      5-уровневая иерархическая пирамида оптического потока (L4: 16×9 → L3: 32×18 → L2: 64×36 → L1: 128×72 → L0: до 256×144) и плотная 2D-сетка 160×90
+                    </div>
+                  </div>
+
+                  {/* Secondary Sub-Frame Cascade FBO inside Global Modal */}
+                  <div className="p-3.5 rounded-2xl flex flex-col gap-2.5" style={{ background: 'var(--surface-card)' }}>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="font-bold">Каскад суб-кадров (Secondary Sub-Frame FBO)</div>
+                        <div className="text-xs" style={{ color: 'var(--text-sub)' }}>
+                          Вторичная генерация внутри промежуточного FBO-буфера (I₀ → I₀.₅ → I₁) для подавления двоения и микро-рывков
+                        </div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={subframeCascadeEnabled}
+                        onChange={(e) => {
+                          setSubframeCascadeEnabled(e.target.checked);
+                          if (e.target.checked && (!interpEnabled || interpMode === 'off')) {
+                            setInterpEnabled(true);
+                            setInterpMode('optical');
+                          }
+                          forceRedrawRef.current = true;
+                        }}
+                        className="w-5 h-5 accent-zinc-900 rounded"
+                      />
+                    </div>
+
+                    <div className="rex-segmented">
+                      {(
+                        [
+                          { id: 'auto' as const, label: 'Авто' },
+                          { id: 2 as const, label: '2x Суб' },
+                          { id: 3 as const, label: '3x Суб' },
+                          { id: 4 as const, label: '4x Суб' }
+                        ]
+                      ).map((m) => (
+                        <button
+                          key={String(m.id)}
+                          type="button"
+                          onClick={() => {
+                            setSubframeCascadeMode(m.id);
+                            setSubframeCascadeEnabled(true);
+                            if (!interpEnabled || interpMode === 'off') {
+                              setInterpEnabled(true);
+                              setInterpMode('optical');
+                            }
+                            forceRedrawRef.current = true;
+                          }}
+                          className={`rex-seg-btn ${subframeCascadeEnabled && subframeCascadeMode === m.id ? 'active' : ''}`}
+                        >
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between text-xs mb-1">
+                        <span>Контроль когерентности векторов</span>
+                        <span className="font-mono-code font-bold">{subframeCoherenceGuard}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={5}
+                        value={subframeCoherenceGuard}
+                        onChange={(e) => {
+                          setSubframeCoherenceGuard(parseInt(e.target.value, 10));
+                          if (!subframeCascadeEnabled) setSubframeCascadeEnabled(true);
+                          forceRedrawRef.current = true;
+                        }}
+                        className="rex-slider"
+                      />
                     </div>
                   </div>
 
@@ -8689,7 +9979,7 @@ export default function App() {
                       <input
                         type="range"
                         min={4}
-                        max={32}
+                        max={48}
                         step={1}
                         value={motionScale}
                         onChange={(e) => {
@@ -8955,13 +10245,13 @@ export default function App() {
               {activeModal === 'about' && (
                 <div className="flex flex-col gap-3">
                   <div className="p-4 rounded-2xl" style={{ background: 'var(--surface-card)' }}>
-                    <div className="rex-serif font-black text-lg">REX Player v2.9.0</div>
+                    <div className="rex-serif font-black text-lg">REX Player v3.0.0</div>
                     <div className="text-xs mt-1" style={{ color: 'var(--text-sub)' }}>
-                      Material You Video Player • Optical Flow MEMC • GPU Super Resolution • HDR10
+                      Material You Video Player • Optical Flow MEMC + Secondary Sub-Frame Cascade FBO • GPU Super Resolution • HDR10
                     </div>
                     <div className="mt-3 text-xs leading-relaxed space-y-1.5" style={{ color: 'var(--text-main)' }}>
-                      <div>• Двухпроходная генерация промежуточных кадров 60/90/120/144 FPS (Блочный поиск SAD + субпиксельный Лукас-Канаде в Adaptive FBO)</div>
-                      <div>• Интерактивный инспектор фазы суб-кадров (α = 0.00..1.00) и встроенный 24.0 FPS кино-тест движения</div>
+                      <div>• Многопроходная интерполяция MEMC 60/90/120/144 FPS + Каскадная рекурсия промежуточных суб-кадров (Pass 2A Anchor FBO I₀.₅ + Pass 2B Secondary Sub-Frame Cascade 2x/3x/4x)</div>
+                      <div>• Контроль когерентности векторов и защита быстрых сцен (Symmetric SAD + инспектор фазы α = 0.00 / 0.25 / 0.50 / 0.75 / 1.00)</div>
                       <div>• GPU Апскейлер видео 1.5x / 2.0x / 4.0x 4K UHD (Snapdragon GSR, FSR/CAS, Anime4K, Кино + De-block)</div>
                       <div>• Аппаратный тонмаппинг HDR10 (ACES Filmic + расширение охвата Rec.2020)</div>
                       <div>• Парсер внешних субтитров .SRT / .VTT и 5-полосный эквалайзер Web Audio API</div>

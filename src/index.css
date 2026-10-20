@@ -285,22 +285,30 @@ input[type="range"].rex-slider::-webkit-slider-thumb:hover {
 
 .rex-segmented {
   display: flex;
+  align-items: center;
   background: var(--surface-pill);
   padding: 3px;
   border-radius: 9999px;
-  gap: 3px;
+  gap: 2px;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .rex-seg-btn {
-  flex: 1;
+  flex: 1 1 0%;
+  min-width: 0;
   border: none;
   background: transparent;
   color: var(--text-sub);
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 600;
-  padding: 7px 9px;
+  padding: 7px 6px;
   border-radius: 9999px;
   cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
   transition: all 0.2s var(--m3-standard);
 }
 

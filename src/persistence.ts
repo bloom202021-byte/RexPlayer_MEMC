@@ -17,14 +17,14 @@ export interface PersistedAppSettings {
   hdrEnabled: boolean;
   hdrStrength: number;
   upscaleEnabled: boolean;
-  upscaleMode: 'fsr' | 'gsr' | 'anime4k' | 'cinema';
-  upscaleFactor: 1.5 | 2.0 | 4.0;
+  upscaleMode: 'gsr' | 'fsr' | 'anime4k' | 'cinema';
+  upscaleFactor: 'auto' | 1.5 | 2.0 | 4.0;
   upscaleSharpness: number;
   upscaleDenoise: number;
   adrenoMode: 'auto' | 'on' | 'off';
   adrenoGmemFp16: boolean;
   adrenoTrue10Hdr: boolean;
-  flowScaleMode: 'auto' | 'performance' | 'balanced' | 'ultra';
+  flowScaleMode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme';
   processorMenuCollapsed: boolean;
   topToolbarCollapsed: boolean;
   fsToolbarCollapsed: boolean;
@@ -42,6 +42,9 @@ export interface PersistedAppSettings {
   interpStrength: number;
   motionScale: number;
   dejudderHaloControl: number;
+  subframeCascadeEnabled: boolean;
+  subframeCascadeMode: 'auto' | '2x' | '3x' | '4x';
+  subframeCoherenceGuard: number;
   detectedDisplayHz: number;
   monochromeFilter: boolean;
   showVectors: boolean;
@@ -75,20 +78,23 @@ export interface ProcessorPresetSettings {
   hdrEnabled: boolean;
   hdrStrength: number;
   upscaleEnabled: boolean;
-  upscaleMode: 'fsr' | 'gsr' | 'anime4k' | 'cinema';
-  upscaleFactor: 1.5 | 2.0 | 4.0;
+  upscaleMode: 'gsr' | 'fsr' | 'anime4k' | 'cinema';
+  upscaleFactor: 'auto' | 1.5 | 2.0 | 4.0;
   upscaleSharpness: number;
   upscaleDenoise: number;
   adrenoMode: 'auto' | 'on' | 'off';
   adrenoGmemFp16: boolean;
   adrenoTrue10Hdr: boolean;
-  flowScaleMode: 'auto' | 'performance' | 'balanced' | 'ultra';
+  flowScaleMode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme';
   interpEnabled: boolean;
   interpMode: 'off' | 'blend' | 'optical';
   targetFps: 60 | 90 | 120 | 144 | 'auto';
   interpStrength: number;
   motionScale: number;
   dejudderHaloControl: number;
+  subframeCascadeEnabled?: boolean;
+  subframeCascadeMode?: 'auto' | '2x' | '3x' | '4x';
+  subframeCoherenceGuard?: number;
   sceneCutProtection: boolean;
   videoBrightness?: number;
   eqEnabled?: boolean;
@@ -114,6 +120,7 @@ export interface CachedVideoRecord {
   size: string;
   sourceLabel: string;
   resolution?: string;
+  thumbnailDataUrl?: string;
   addedAt: number;
 }
 
@@ -135,9 +142,9 @@ export const DEFAULT_APP_SETTINGS: PersistedAppSettings = {
   hdrStrength: 1.0,
   upscaleEnabled: true,
   upscaleMode: 'gsr',
-  upscaleFactor: 2.0,
-  upscaleSharpness: 0.85,
-  upscaleDenoise: 0.0,
+  upscaleFactor: 'auto',
+  upscaleSharpness: 0.9,
+  upscaleDenoise: 0.35,
   adrenoMode: 'auto',
   adrenoGmemFp16: true,
   adrenoTrue10Hdr: true,
@@ -159,6 +166,9 @@ export const DEFAULT_APP_SETTINGS: PersistedAppSettings = {
   interpStrength: 1.0,
   motionScale: 20,
   dejudderHaloControl: 40,
+  subframeCascadeEnabled: true,
+  subframeCascadeMode: 'auto',
+  subframeCoherenceGuard: 75,
   detectedDisplayHz: 60,
   monochromeFilter: false,
   showVectors: false,
@@ -195,15 +205,93 @@ function sanitizeInterpMode(rawMode: unknown): 'off' | 'blend' | 'optical' {
   return 'optical';
 }
 
+function sanitizeUpscaleMode(
+  rawMode: unknown
+): 'gsr' | 'fsr' | 'anime4k' | 'cinema' {
+  if (
+    rawMode === 'gsr' ||
+    rawMode === 'fsr' ||
+    rawMode === 'anime4k' ||
+    rawMode === 'cinema'
+  ) {
+    return rawMode;
+  }
+  return 'gsr';
+}
+
+function sanitizeUpscaleFactor(rawFactor: unknown): 'auto' | 1.5 | 2.0 | 4.0 {
+  if (
+    rawFactor === 'auto' ||
+    rawFactor === 1.5 ||
+    rawFactor === 2.0 ||
+    rawFactor === 4.0
+  ) {
+    return rawFactor;
+  }
+  return 'auto';
+}
+
+function sanitizeFlowScaleMode(
+  rawMode: unknown
+): 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme' {
+  if (
+    rawMode === 'auto' ||
+    rawMode === 'performance' ||
+    rawMode === 'balanced' ||
+    rawMode === 'ultra' ||
+    rawMode === 'extreme'
+  ) {
+    return rawMode;
+  }
+  return 'auto';
+}
+
+function sanitizeMotionScale(rawVal: unknown): number {
+  if (typeof rawVal === 'number' && isFinite(rawVal)) {
+    return Math.max(4, Math.min(48, Math.round(rawVal)));
+  }
+  return DEFAULT_APP_SETTINGS.motionScale;
+}
+
+function sanitizeSubframeCascadeMode(
+  rawMode: unknown
+): 'auto' | '2x' | '3x' | '4x' {
+  if (rawMode === 'auto' || rawMode === '2x' || rawMode === '3x' || rawMode === '4x') {
+    return rawMode;
+  }
+  return 'auto';
+}
+
+function sanitizeSubframeCoherenceGuard(rawVal: unknown): number {
+  if (typeof rawVal === 'number' && isFinite(rawVal)) {
+    return Math.max(0, Math.min(100, Math.round(rawVal)));
+  }
+  return DEFAULT_APP_SETTINGS.subframeCoherenceGuard;
+}
+
 export function loadPersistedSettings(): PersistedAppSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (!raw) return DEFAULT_APP_SETTINGS;
-    const parsed = JSON.parse(raw) as Partial<PersistedAppSettings> & { interpMode?: unknown };
+    const parsed = JSON.parse(raw) as Partial<PersistedAppSettings> & {
+      interpMode?: unknown;
+      upscaleMode?: unknown;
+      upscaleFactor?: unknown;
+      flowScaleMode?: unknown;
+      motionScale?: unknown;
+      subframeCascadeMode?: unknown;
+      subframeCoherenceGuard?: unknown;
+    };
     return {
       ...DEFAULT_APP_SETTINGS,
       ...parsed,
       interpMode: sanitizeInterpMode(parsed.interpMode),
+      upscaleMode: sanitizeUpscaleMode(parsed.upscaleMode),
+      upscaleFactor: sanitizeUpscaleFactor(parsed.upscaleFactor),
+      flowScaleMode: sanitizeFlowScaleMode(parsed.flowScaleMode),
+      motionScale: sanitizeMotionScale(parsed.motionScale),
+      subframeCascadeMode: sanitizeSubframeCascadeMode(parsed.subframeCascadeMode),
+      subframeCoherenceGuard: sanitizeSubframeCoherenceGuard(parsed.subframeCoherenceGuard),
       collapsedSections: {
         ...DEFAULT_APP_SETTINGS.collapsedSections,
         ...(parsed.collapsedSections || {})
@@ -264,7 +352,13 @@ export function loadUserPresets(): UserCustomPreset[] {
       ...p,
       settings: {
         ...p.settings,
-        interpMode: sanitizeInterpMode(p?.settings?.interpMode)
+        interpMode: sanitizeInterpMode(p?.settings?.interpMode),
+        upscaleMode: sanitizeUpscaleMode(p?.settings?.upscaleMode),
+        upscaleFactor: sanitizeUpscaleFactor(p?.settings?.upscaleFactor),
+        flowScaleMode: sanitizeFlowScaleMode(p?.settings?.flowScaleMode),
+        motionScale: sanitizeMotionScale(p?.settings?.motionScale),
+        subframeCascadeMode: sanitizeSubframeCascadeMode(p?.settings?.subframeCascadeMode),
+        subframeCoherenceGuard: sanitizeSubframeCoherenceGuard(p?.settings?.subframeCoherenceGuard)
       }
     }));
   } catch {
@@ -332,8 +426,9 @@ export async function saveVideoToVault(record: CachedVideoRecord): Promise<void>
 
 export async function updateVideoMetaInVault(
   id: string,
-  duration: number,
-  resolution?: string
+  duration?: number,
+  resolution?: string,
+  thumbnailDataUrl?: string
 ): Promise<void> {
   try {
     const db = await openMediaVaultDb();
@@ -346,8 +441,9 @@ export async function updateVideoMetaInVault(
         if (existing) {
           store.put({
             ...existing,
-            duration: duration > 0 ? duration : existing.duration,
-            resolution: resolution || existing.resolution
+            duration: duration && duration > 0 ? duration : existing.duration,
+            resolution: resolution || existing.resolution,
+            thumbnailDataUrl: thumbnailDataUrl || existing.thumbnailDataUrl
           });
         }
       };
