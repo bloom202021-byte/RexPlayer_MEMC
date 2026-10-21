@@ -96,6 +96,36 @@ const snapToCanonicalCadenceMs = (rawIntervalMs: number): number => {
   return rawIntervalMs;
 };
 
+// Fast O(log N) binary search for active subtitle cues with multi-speaker overlap support
+const findActiveSubtitleText = (cues: SubtitleCue[], timeSec: number): string => {
+  const len = cues.length;
+  if (len === 0) return '';
+  let lo = 0;
+  let hi = len - 1;
+  let firstPossibleIdx = len;
+  // Find first cue whose start <= timeSec + 0.001, then scan nearby cues
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (cues[mid].start <= timeSec) {
+      firstPossibleIdx = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (firstPossibleIdx === len) return '';
+  // Scan backwards briefly to include any earlier-starting long cue that still overlaps timeSec
+  const startScan = Math.max(0, firstPossibleIdx - 6);
+  let matched = '';
+  for (let i = startScan; i <= firstPossibleIdx; i++) {
+    const c = cues[i];
+    if (timeSec >= c.start && timeSec <= c.end) {
+      matched = matched ? `${matched}\n${c.text}` : c.text;
+    }
+  }
+  return matched;
+};
+
 export default function App() {
   // Load persisted settings synchronously once on startup so nothing resets on exit
   const initialSettingsRef = useRef(loadPersistedSettings());
@@ -420,6 +450,7 @@ export default function App() {
   const lastKeyframeUploadPerfNowRef = useRef<number>(0);
   const lastMediaTimeRef = useRef<number>(-1);
   const hasNewVideoFrameRef = useRef<boolean>(false);
+  const justSeekedRef = useRef<boolean>(false);
   const rVfcActiveRef = useRef<boolean>(false);
   const rVfcPendingRef = useRef<boolean>(false);
   const rVFCIdRef = useRef<number | null>(null);
@@ -428,8 +459,21 @@ export default function App() {
   const estimatedFrameIntervalMsRef = useRef<number>(33.33); // ~30fps default
   const forceRedrawRef = useRef<boolean>(true);
   const savedPositionsRef = useRef<Record<string, number>>(loadSavedPositions());
+  const lastFallbackPosSaveRef = useRef<number>(0);
   const activeVideoUrlRef = useRef<string>('');
   const activeVideoKeyRef = useRef<string>('');
+
+  // Clear all active UI timers on component unmount
+  useEffect(() => {
+    return () => {
+      if (toastTimeoutRef.current) window.clearTimeout(toastTimeoutRef.current);
+      if (seekBadgeTimeoutRef.current) window.clearTimeout(seekBadgeTimeoutRef.current);
+      if (swipeHudTimeoutRef.current) window.clearTimeout(swipeHudTimeoutRef.current);
+      if (holdTimerRef.current) window.clearTimeout(holdTimerRef.current);
+      if (singleTapTimerRef.current) window.clearTimeout(singleTapTimerRef.current);
+      if (fsHideTimerRef.current) window.clearTimeout(fsHideTimerRef.current);
+    };
+  }, []);
 
   // Effective Qualcomm Adreno acceleration status (Auto-detected Adreno OR manually enabled OR GSR selected)
   const isAdrenoActive =
@@ -501,9 +545,9 @@ export default function App() {
       ? 'QHD 2K (2.0x)'
       : '4K UHD (4.0x)';
 
-  // Automatic persistence of all user settings to localStorage
+  // Automatic persistence of all user settings to localStorage (debounced to prevent synchronous main-thread stalls during slider drags)
   useEffect(() => {
-    savePersistedSettings({
+    const payload = {
       activeScreen,
       activeTab,
       darkTheme,
@@ -565,7 +609,11 @@ export default function App() {
       longPressSpeed2x,
       videoOutputMode,
       lastActiveVideoId
-    });
+    };
+    const timer = window.setTimeout(() => {
+      savePersistedSettings(payload);
+    }, 100);
+    return () => window.clearTimeout(timer);
   }, [
     activeScreen,
     activeTab,
@@ -959,9 +1007,7 @@ export default function App() {
   // Active subtitle cue computed cleanly from currentTime
   const activeSubtitleCue = React.useMemo(() => {
     if (!subtitlesEnabled || !subtitleCues.length) return '';
-    const adjustedTime = currentTime - subDelaySec;
-    const found = subtitleCues.find((c) => adjustedTime >= c.start && adjustedTime <= c.end);
-    return found ? found.text : '';
+    return findActiveSubtitleText(subtitleCues, currentTime - subDelaySec);
   }, [currentTime, subDelaySec, subtitleCues, subtitlesEnabled]);
 
   // Subtitle File Parser (.srt and .vtt)
@@ -1004,7 +1050,7 @@ export default function App() {
         .trim();
       if (content) cues.push({ start, end, text: content });
     }
-    return cues;
+    return cues.sort((a, b) => a.start - b.start);
   };
 
   const loadSubtitleFileObject = useCallback(
@@ -1043,11 +1089,11 @@ export default function App() {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${d}`;
   };
 
-  // Automatic Background Video Preview Thumbnail & Metadata Extractor (320x180 JPEG DataURL)
+  // Automatic Background Video Preview Thumbnail & Metadata Extractor (320x180 JPEG DataURL with black-frame retry)
   const generateVideoThumbnail = useCallback((videoUrl: string, videoId: string) => {
     if (!videoUrl) return;
     const tempVid = document.createElement('video');
-    tempVid.preload = 'metadata';
+    tempVid.preload = 'auto';
     tempVid.muted = true;
     tempVid.playsInline = true;
     if (videoUrl.startsWith('http://') || videoUrl.startsWith('https://')) {
@@ -1055,6 +1101,7 @@ export default function App() {
     }
 
     let finished = false;
+    let retriedBlackFrame = false;
     const cleanup = () => {
       if (finished) return;
       finished = true;
@@ -1067,7 +1114,92 @@ export default function App() {
       }
     };
 
-    const timeoutId = window.setTimeout(cleanup, 9000);
+    const timeoutId = window.setTimeout(cleanup, 10000);
+
+    const captureFrameToVault = () => {
+      if (finished) return;
+      try {
+        const vw = tempVid.videoWidth || 320;
+        const vh = tempVid.videoHeight || 180;
+        const thumbW = 320;
+        const thumbH = 180;
+        const canvas = document.createElement('canvas');
+        canvas.width = thumbW;
+        canvas.height = thumbH;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#09090c';
+          ctx.fillRect(0, 0, thumbW, thumbH);
+          const scale = Math.max(thumbW / Math.max(1, vw), thumbH / Math.max(1, vh));
+          const drawW = vw * scale;
+          const drawH = vh * scale;
+          const dx = (thumbW - drawW) * 0.5;
+          const dy = (thumbH - drawH) * 0.5;
+          ctx.drawImage(tempVid, dx, dy, drawW, drawH);
+
+          // Check if the captured frame is a dark fade-in frame and retry once deeper into the video
+          const dur = isFinite(tempVid.duration) && tempVid.duration > 0 ? tempVid.duration : 0;
+          if (!retriedBlackFrame && dur > 3.0) {
+            try {
+              const sample = ctx.getImageData(40, 20, 240, 140).data;
+              let lumaSum = 0;
+              const step = 64;
+              let count = 0;
+              for (let i = 0; i < sample.length; i += step) {
+                lumaSum += sample[i] * 0.299 + sample[i + 1] * 0.587 + sample[i + 2] * 0.114;
+                count++;
+              }
+              const avgLuma = count > 0 ? lumaSum / count : 30;
+              if (avgLuma < 10) {
+                retriedBlackFrame = true;
+                tempVid.currentTime = Math.min(dur - 0.2, Math.max(2.2, dur * 0.32));
+                return;
+              }
+            } catch {
+              // Ignore getImageData security errors
+            }
+          }
+
+          const thumbDataUrl = canvas.toDataURL('image/jpeg', 0.82);
+          const resStr = vw > 0 && vh > 0 ? `${vw}×${vh}` : undefined;
+
+          if (thumbDataUrl && thumbDataUrl.length > 128) {
+            setUserVideos((prev) =>
+              prev.map((v) =>
+                v.id === videoId
+                  ? {
+                      ...v,
+                      duration: dur > 0 ? dur : v.duration,
+                      resolution: resStr || v.resolution,
+                      thumbnailUrl: thumbDataUrl
+                    }
+                  : v
+              )
+            );
+            setPlaylist((prev) =>
+              prev.map((v) =>
+                v.id === videoId
+                  ? {
+                      ...v,
+                      duration: dur > 0 ? dur : v.duration,
+                      resolution: resStr || v.resolution,
+                      thumbnailUrl: thumbDataUrl
+                    }
+                  : v
+              )
+            );
+            void updateVideoMetaInVault(videoId, dur, resStr, thumbDataUrl);
+          }
+        }
+      } catch {
+        // Ignore cross-origin canvas taint if remote URL
+      } finally {
+        if (!retriedBlackFrame || finished) {
+          window.clearTimeout(timeoutId);
+          cleanup();
+        }
+      }
+    };
 
     tempVid.onloadedmetadata = () => {
       if (finished) return;
@@ -1102,75 +1234,26 @@ export default function App() {
         void updateVideoMetaInVault(videoId, dur, resStr);
       }
 
-      // Seek into a representative frame (~1.2s or 15% of video) to avoid black fade-in frames
-      const targetTime = dur > 2.0 ? Math.min(2.5, Math.max(0.8, dur * 0.15)) : Math.min(0.2, dur * 0.5);
+      // Seek into a representative frame (~1.2s or 15% of video, or 0.5s if duration is unknown)
+      const targetTime =
+        dur > 2.0
+          ? Math.min(2.5, Math.max(0.8, dur * 0.15))
+          : dur > 0
+          ? Math.max(0.05, Math.min(0.4, dur * 0.4))
+          : 0.5;
       try {
         tempVid.currentTime = targetTime;
       } catch {
-        cleanup();
-        window.clearTimeout(timeoutId);
+        captureFrameToVault();
       }
     };
 
     tempVid.onseeked = () => {
-      if (finished) return;
-      try {
-        const vw = tempVid.videoWidth || 320;
-        const vh = tempVid.videoHeight || 180;
-        const thumbW = 320;
-        const thumbH = 180;
-        const canvas = document.createElement('canvas');
-        canvas.width = thumbW;
-        canvas.height = thumbH;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.fillStyle = '#09090c';
-          ctx.fillRect(0, 0, thumbW, thumbH);
-          const scale = Math.max(thumbW / Math.max(1, vw), thumbH / Math.max(1, vh));
-          const drawW = vw * scale;
-          const drawH = vh * scale;
-          const dx = (thumbW - drawW) * 0.5;
-          const dy = (thumbH - drawH) * 0.5;
-          ctx.drawImage(tempVid, dx, dy, drawW, drawH);
-
-          const thumbDataUrl = canvas.toDataURL('image/jpeg', 0.8);
-          const dur = isFinite(tempVid.duration) && tempVid.duration > 0 ? tempVid.duration : 0;
-          const resStr = vw > 0 && vh > 0 ? `${vw}×${vh}` : undefined;
-
-          if (thumbDataUrl && thumbDataUrl.length > 128) {
-            setUserVideos((prev) =>
-              prev.map((v) =>
-                v.id === videoId
-                  ? {
-                      ...v,
-                      duration: dur > 0 ? dur : v.duration,
-                      resolution: resStr || v.resolution,
-                      thumbnailUrl: thumbDataUrl
-                    }
-                  : v
-              )
-            );
-            setPlaylist((prev) =>
-              prev.map((v) =>
-                v.id === videoId
-                  ? {
-                      ...v,
-                      duration: dur > 0 ? dur : v.duration,
-                      resolution: resStr || v.resolution,
-                      thumbnailUrl: thumbDataUrl
-                    }
-                  : v
-              )
-            );
-            void updateVideoMetaInVault(videoId, dur, resStr, thumbDataUrl);
-          }
-        }
-      } catch {
-        // Ignore cross-origin canvas taint if remote URL
-      } finally {
-        window.clearTimeout(timeoutId);
-        cleanup();
+      const wasRetry = retriedBlackFrame;
+      if (wasRetry) {
+        retriedBlackFrame = false; // Allow finally block to cleanup after retry capture
       }
+      captureFrameToVault();
     };
 
     tempVid.onerror = () => {
@@ -1181,20 +1264,26 @@ export default function App() {
     tempVid.src = videoUrl;
   }, []);
 
-  // Unified helper for accurate seeking (updates video, state, DOM scrubbers, and triggers WebGL redraw even when paused)
+  // Unified helper for accurate seeking (updates video, DOM scrubbers, and triggers WebGL redraw; can defer React state commit during continuous slider drag)
   const seekToTime = useCallback(
-    (targetSec: number) => {
+    (targetSec: number, commitReactState: boolean = true) => {
       const maxDur = duration > 0 ? duration : Math.max(100, currentTimeRef.current + 30);
       const clamped = Math.max(0, Math.min(maxDur, targetSec));
       currentTimeRef.current = clamped;
-      setCurrentTime(clamped);
+      if (commitReactState) {
+        setCurrentTime(clamped);
+      }
       forceRedrawRef.current = true;
 
       if (isDemoTestActive) {
         forceDemoStepRef.current = true;
         hasNewVideoFrameRef.current = true;
       } else if (videoRef.current && hasLoadedVideo) {
-        videoRef.current.currentTime = clamped;
+        const nowMs = performance.now();
+        if (commitReactState || nowMs - lastSwipeSeekSyncRef.current >= 35) {
+          lastSwipeSeekSyncRef.current = nowMs;
+          videoRef.current.currentTime = clamped;
+        }
       }
       if (timecodeDisplayRef.current) {
         timecodeDisplayRef.current.textContent = formatTime(clamped);
@@ -1212,20 +1301,12 @@ export default function App() {
         if (!subtitlesEnabled || !subtitleCues.length) {
           subtitleBoxRef.current.style.display = 'none';
         } else {
-          const adjTime = clamped - subDelaySec;
-          let cueText = '';
-          for (let i = 0; i < subtitleCues.length; i++) {
-            const c = subtitleCues[i];
-            if (adjTime >= c.start && adjTime <= c.end) {
-              cueText = c.text;
-              break;
-            }
-          }
+          const cueText = findActiveSubtitleText(subtitleCues, clamped - subDelaySec);
           subtitleTextSpanRef.current.textContent = cueText;
           subtitleBoxRef.current.style.display = cueText ? 'flex' : 'none';
         }
       }
-      if (rememberPosition && !isDemoTestActive) {
+      if (commitReactState && rememberPosition && !isDemoTestActive) {
         if (activeVideoKeyRef.current) {
           savedPositionsRef.current[activeVideoKeyRef.current] = clamped;
         }
@@ -1437,12 +1518,14 @@ export default function App() {
 
       vid.onloadeddata = () => {
         armVideoFrameCallback();
+        justSeekedRef.current = true;
         hasNewVideoFrameRef.current = true;
         forceRedrawRef.current = true;
       };
 
       vid.onseeked = () => {
         armVideoFrameCallback();
+        justSeekedRef.current = true;
         hasNewVideoFrameRef.current = true;
         lastDecodedPerfNowRef.current = performance.now();
         lastKeyframeUploadPerfNowRef.current = performance.now();
@@ -1586,16 +1669,30 @@ export default function App() {
   );
 
   const handleNextTrack = useCallback(() => {
-    if (!playlist.length) return;
-    const nextIdx = (activePlaylistIndex + 1) % playlist.length;
+    if (!playlist.length) {
+      if (hasLoadedVideo || isDemoTestActive) seekToTime(0);
+      return;
+    }
+    if (playlist.length === 1 && !isDemoTestActive && hasLoadedVideo) {
+      seekToTime(0);
+      return;
+    }
+    const nextIdx = isDemoTestActive ? activePlaylistIndex % playlist.length : (activePlaylistIndex + 1) % playlist.length;
     playPlaylistIndex(nextIdx);
-  }, [activePlaylistIndex, playPlaylistIndex, playlist.length]);
+  }, [activePlaylistIndex, hasLoadedVideo, isDemoTestActive, playPlaylistIndex, playlist.length, seekToTime]);
 
   const handlePrevTrack = useCallback(() => {
-    if (!playlist.length) return;
-    const prevIdx = (activePlaylistIndex - 1 + playlist.length) % playlist.length;
+    if (!playlist.length) {
+      if (hasLoadedVideo || isDemoTestActive) seekToTime(0);
+      return;
+    }
+    if (playlist.length === 1 && !isDemoTestActive && hasLoadedVideo) {
+      seekToTime(0);
+      return;
+    }
+    const prevIdx = isDemoTestActive ? activePlaylistIndex % playlist.length : (activePlaylistIndex - 1 + playlist.length) % playlist.length;
     playPlaylistIndex(prevIdx);
-  }, [activePlaylistIndex, playPlaylistIndex, playlist.length]);
+  }, [activePlaylistIndex, hasLoadedVideo, isDemoTestActive, playPlaylistIndex, playlist.length, seekToTime]);
 
   const clearAllVideos = useCallback(() => {
     if (videoRef.current) {
@@ -1710,8 +1807,11 @@ export default function App() {
 
     const onContextRestored = () => {
       initGlResources();
+      lastPass1Signature = '';
+      lastPass2ASignature = '';
       setWebglContextLost(false);
       lastDecodedVideoTimeRef.current = -1;
+      justSeekedRef.current = true;
       hasNewVideoFrameRef.current = true;
       forceRedrawRef.current = true;
       showToast('WebGL контекст и шейдеры восстановлены');
@@ -2518,36 +2618,38 @@ export default function App() {
                 if (u_alpha <= 0.5) {
                   // Sub-interval [0.0, 0.5]: warp between Keyframe T-1 (u_prevTex) and Synthesized Anchor I_0.5 (u_subframeMidTex)
                   mediump float beta = clamp(u_alpha * 2.0, 0.0, 1.0);
+                  mediump float endEnv = 4.0 * beta * (1.0 - beta);
                   vec2 uvSubPrev = clamp(mappedUV - beta * halfShiftUV, vec2(0.001), vec2(0.999));
                   vec2 uvSubMid  = clamp(mappedUV + (1.0 - beta) * halfShiftUV, vec2(0.001), vec2(0.999));
                   mediump vec3 cSubPrev = texture2D(u_prevTex, uvSubPrev).rgb;
                   mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
                   subErr = length(cSubPrev - cSubMid);
-                  mediump float subWeight = clamp(beta + dirSelect * 0.28, 0.0, 1.0);
+                  mediump float subWeight = clamp(beta + dirSelect * 0.28 * endEnv, 0.0, 1.0);
                   cascadeColor = mix(cSubPrev, cSubMid, subWeight);
 
                   if (u_subframeCascade >= 3) {
                     // 3x / 4x Multi-Tap Trajectory Stabilization along the [T-1 -> I_0.5] sub-vector
                     vec2 uvSubQ = clamp(mappedUV + (0.5 - beta) * halfShiftUV * 0.5, vec2(0.001), vec2(0.999));
-                    mediump vec3 cSubQ = mix(cSubPrev, texture2D(u_subframeMidTex, uvSubQ).rgb, clamp(beta * 1.15, 0.0, 1.0));
-                    cascadeColor = mix(cascadeColor, cSubQ, (u_subframeCascade == 4) ? 0.30 : 0.18);
+                    mediump vec3 cSubQ = mix(cSubPrev, texture2D(u_subframeMidTex, uvSubQ).rgb, beta);
+                    cascadeColor = mix(cascadeColor, cSubQ, ((u_subframeCascade == 4) ? 0.30 : 0.18) * endEnv);
                   }
                 } else {
                   // Sub-interval [0.5, 1.0]: warp between Synthesized Anchor I_0.5 (u_subframeMidTex) and Keyframe T (u_currTex)
                   mediump float beta = clamp((u_alpha - 0.5) * 2.0, 0.0, 1.0);
+                  mediump float endEnv = 4.0 * beta * (1.0 - beta);
                   vec2 uvSubMid  = clamp(mappedUV - beta * halfShiftUV, vec2(0.001), vec2(0.999));
                   vec2 uvSubCurr = clamp(mappedUV + (1.0 - beta) * halfShiftUV, vec2(0.001), vec2(0.999));
                   mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
                   mediump vec3 cSubCurr = texture2D(u_currTex, uvSubCurr).rgb;
                   subErr = length(cSubMid - cSubCurr);
-                  mediump float subWeight = clamp(beta + dirSelect * 0.28, 0.0, 1.0);
+                  mediump float subWeight = clamp(beta + dirSelect * 0.28 * endEnv, 0.0, 1.0);
                   cascadeColor = mix(cSubMid, cSubCurr, subWeight);
 
                   if (u_subframeCascade >= 3) {
                     // 3x / 4x Multi-Tap Trajectory Stabilization along the [I_0.5 -> T] sub-vector
                     vec2 uvSubQ = clamp(mappedUV - (beta - 0.5) * halfShiftUV * 0.5, vec2(0.001), vec2(0.999));
-                    mediump vec3 cSubQ = mix(texture2D(u_subframeMidTex, uvSubQ).rgb, cSubCurr, clamp(beta * 0.88, 0.0, 1.0));
-                    cascadeColor = mix(cascadeColor, cSubQ, (u_subframeCascade == 4) ? 0.30 : 0.18);
+                    mediump vec3 cSubQ = mix(texture2D(u_subframeMidTex, uvSubQ).rgb, cSubCurr, beta);
+                    cascadeColor = mix(cascadeColor, cSubQ, ((u_subframeCascade == 4) ? 0.30 : 0.18) * endEnv);
                   }
                 }
 
@@ -3614,7 +3716,9 @@ export default function App() {
 
         const shouldUploadFrame =
           vid.readyState >= 2 &&
+          (!vid.seeking || isScrubbingRef.current || justSeekedRef.current) &&
           (isFirstFrame ||
+            justSeekedRef.current ||
             (hasNewVideoFrameRef.current && (hasGenuineTimeStep || isScrubbingRef.current)) ||
             hasNewQualityFrame ||
             (!rVfcActiveRef.current && currentDecodedFrames <= 0 && mediaDeltaSec >= fallbackIntervalSec) ||
@@ -3657,6 +3761,7 @@ export default function App() {
               ? pendingMediaTimeRef.current
               : vidTime;
           hasNewVideoFrameRef.current = false;
+          justSeekedRef.current = false;
 
           const updatedSig = `vid:${lastDecodedVideoTimeRef.current.toFixed(4)}:${isFlowNeeded}:${cfg.showSadHeatmap}:${targetFlowCols}x${targetFlowRows}:${maxShiftVal.toFixed(5)}:${cfg.sceneCutProtection}:${adrenoOptVal}`;
 
@@ -4034,7 +4139,7 @@ export default function App() {
           }
         }
 
-        // Update Subtitle Overlay directly via DOM ref
+        // Update Subtitle Overlay directly via DOM ref (O(log N) binary search)
         if (subtitleBoxRef.current && subtitleTextSpanRef.current) {
           if (!cfg.subtitlesEnabled || !cfg.subtitleCues.length) {
             if (lastSubtitleStr !== '') {
@@ -4042,15 +4147,10 @@ export default function App() {
               lastSubtitleStr = '';
             }
           } else {
-            const adjTime = currentTimeRef.current - cfg.subDelaySec;
-            let cueText = '';
-            for (let i = 0; i < cfg.subtitleCues.length; i++) {
-              const c = cfg.subtitleCues[i];
-              if (adjTime >= c.start && adjTime <= c.end) {
-                cueText = c.text;
-                break;
-              }
-            }
+            const cueText = findActiveSubtitleText(
+              cfg.subtitleCues,
+              currentTimeRef.current - cfg.subDelaySec
+            );
             if (cueText !== lastSubtitleStr) {
               lastSubtitleStr = cueText;
               subtitleTextSpanRef.current.textContent = cueText;
@@ -4135,9 +4235,8 @@ export default function App() {
     };
   }, []);
 
-  // Re-draw video frame immediately if aspectMode is toggled
+  // Re-draw video frame immediately if aspectMode is toggled (preserve glPrevTex & optical flow history when paused!)
   useEffect(() => {
-    lastDecodedVideoTimeRef.current = -1;
     forceRedrawRef.current = true;
   }, [aspectMode]);
 
@@ -4282,7 +4381,6 @@ export default function App() {
 
       isScrubbingRef.current = true;
       currentTimeRef.current = targetTime;
-      setCurrentTime(targetTime);
       forceRedrawRef.current = true;
 
       if (timecodeDisplayRef.current) {
@@ -4296,6 +4394,15 @@ export default function App() {
       }
       if (fsScrubberInputRef.current) {
         fsScrubberInputRef.current.value = String(targetTime);
+      }
+      if (subtitleBoxRef.current && subtitleTextSpanRef.current) {
+        if (!subtitlesEnabled || !subtitleCues.length) {
+          subtitleBoxRef.current.style.display = 'none';
+        } else {
+          const cueText = findActiveSubtitleText(subtitleCues, targetTime - subDelaySec);
+          subtitleTextSpanRef.current.textContent = cueText;
+          subtitleBoxRef.current.style.display = cueText ? 'flex' : 'none';
+        }
       }
 
       if (isDemoTestActive) {
@@ -4333,11 +4440,21 @@ export default function App() {
     const g = swipeGestureRef.current;
     if (g.active && g.pointerId === e.pointerId) {
       if (g.lockedAxis === 'horizontal') {
+        setCurrentTime(currentTimeRef.current);
         if (isDemoTestActive) {
           forceDemoStepRef.current = true;
           forceRedrawRef.current = true;
         } else if (videoRef.current && hasLoadedVideo) {
           videoRef.current.currentTime = currentTimeRef.current;
+        }
+        if (rememberPosition && !isDemoTestActive) {
+          if (activeVideoKeyRef.current) {
+            savedPositionsRef.current[activeVideoKeyRef.current] = currentTimeRef.current;
+          }
+          if (activeVideoUrlRef.current) {
+            savedPositionsRef.current[activeVideoUrlRef.current] = currentTimeRef.current;
+          }
+          saveSavedPositions(savedPositionsRef.current);
         }
         isScrubbingRef.current = false;
       }
@@ -4543,6 +4660,7 @@ export default function App() {
 
       if (addedVideos.length > 0) {
         setUserVideos((prev) => {
+          const prevMap = new Map(prev.map((p) => [p.id, p]));
           const addedIds = new Set(addedVideos.map((v) => v.id));
           prev.forEach((p) => {
             if (
@@ -4558,11 +4676,34 @@ export default function App() {
               }
             }
           });
-          return [...addedVideos, ...prev.filter((p) => !addedIds.has(p.id))];
+          const mergedAdded = addedVideos.map((v) => {
+            const existing = prevMap.get(v.id);
+            return existing
+              ? {
+                  ...v,
+                  duration: v.duration || existing.duration,
+                  resolution: v.resolution || existing.resolution,
+                  thumbnailUrl: v.thumbnailUrl || existing.thumbnailUrl
+                }
+              : v;
+          });
+          return [...mergedAdded, ...prev.filter((p) => !addedIds.has(p.id))];
         });
         setPlaylist((prev) => {
+          const prevMap = new Map(prev.map((p) => [p.id, p]));
           const addedIds = new Set(addedVideos.map((v) => v.id));
-          return [...addedVideos, ...prev.filter((p) => !addedIds.has(p.id))];
+          const mergedAdded = addedVideos.map((v) => {
+            const existing = prevMap.get(v.id);
+            return existing
+              ? {
+                  ...v,
+                  duration: v.duration || existing.duration,
+                  resolution: v.resolution || existing.resolution,
+                  thumbnailUrl: v.thumbnailUrl || existing.thumbnailUrl
+                }
+              : v;
+          });
+          return [...mergedAdded, ...prev.filter((p) => !addedIds.has(p.id))];
         });
         setActivePlaylistIndex(0);
 
@@ -4826,6 +4967,13 @@ export default function App() {
     setDoubleTapSeekSec(def.doubleTapSeekSec);
     setSwipeVolumeBright(def.swipeVolumeBright);
     setLongPressSpeed2x(def.longPressSpeed2x);
+    setVideoOutputMode(def.videoOutputMode);
+    if (videoRef.current) {
+      videoRef.current.playbackRate = def.playbackRate;
+      videoRef.current.volume = def.volume;
+      videoRef.current.muted = def.isMuted;
+      videoRef.current.preservesPitch = def.pitchCorrection;
+    }
     forceRedrawRef.current = true;
     showToast('Все настройки сброшены к значениям по умолчанию');
   }, [showToast]);
@@ -4838,9 +4986,10 @@ export default function App() {
       return;
     }
     const title = cleanUrl.split('/').pop() || 'Network_Stream.mp4';
+    const streamId = `net_${Date.now()}`;
 
     const newItem: LibraryVideoItem = {
-      id: `net_${Date.now()}`,
+      id: streamId,
       title,
       fileUrl: cleanUrl,
       fps: 24,
@@ -4848,6 +4997,17 @@ export default function App() {
       size: 'Поток URL',
       sourceLabel: 'Сеть • Direct Stream'
     };
+
+    void saveVideoToVault({
+      id: streamId,
+      title,
+      remoteUrl: cleanUrl,
+      fps: 24,
+      duration: 0,
+      size: 'Поток URL',
+      sourceLabel: 'Сеть • Direct Stream',
+      addedAt: Date.now()
+    });
 
     setUserVideos((prev) => [newItem, ...prev]);
     setPlaylist((prev) => [newItem, ...prev]);
@@ -5824,7 +5984,11 @@ export default function App() {
         <button
           type="button"
           onClick={() => {
-            if (!hasLoadedVideo && !isDemoTestActive && userVideos.length === 0) {
+            if (!hasLoadedVideo && !isDemoTestActive) {
+              if (resumeVideoItem) {
+                playLibraryItem(resumeVideoItem);
+                return;
+              }
               startBuiltIn24FpsTest();
               return;
             }
@@ -6082,7 +6246,7 @@ export default function App() {
                     <div>
                       <div className="rex-serif font-bold text-base">О приложении</div>
                       <div className="text-xs mt-0.5" style={{ color: 'var(--text-sub)' }}>
-                        REX Player v2.9.0
+                        REX Player v3.0.0
                       </div>
                     </div>
                   </div>
@@ -6440,23 +6604,19 @@ export default function App() {
                     if (activeVideoUrlRef.current) {
                       savedPositionsRef.current[activeVideoUrlRef.current] = t;
                     }
-                    saveSavedPositions(savedPositionsRef.current);
+                    const nowPerf = performance.now();
+                    if (nowPerf - lastFallbackPosSaveRef.current >= 1500) {
+                      lastFallbackPosSaveRef.current = nowPerf;
+                      saveSavedPositions(savedPositionsRef.current);
+                    }
                   }
 
-                  // Synchronize subtitle cues during Video Fallback mode
+                  // Synchronize subtitle cues during Video Fallback mode (O(log N) binary search)
                   if (subtitleBoxRef.current && subtitleTextSpanRef.current) {
                     if (!subtitlesEnabled || !subtitleCues.length) {
                       subtitleBoxRef.current.style.display = 'none';
                     } else {
-                      const adjTime = t - subDelaySec;
-                      let cueText = '';
-                      for (let i = 0; i < subtitleCues.length; i++) {
-                        const c = subtitleCues[i];
-                        if (adjTime >= c.start && adjTime <= c.end) {
-                          cueText = c.text;
-                          break;
-                        }
-                      }
+                      const cueText = findActiveSubtitleText(subtitleCues, t - subDelaySec);
                       subtitleTextSpanRef.current.textContent = cueText;
                       subtitleBoxRef.current.style.display = cueText ? 'flex' : 'none';
                     }
@@ -7587,17 +7747,22 @@ export default function App() {
                     }}
                     onPointerUp={() => {
                       isScrubbingRef.current = false;
+                      seekToTime(currentTimeRef.current, true);
                       revealFsControls();
                     }}
                     onPointerCancel={() => {
                       isScrubbingRef.current = false;
+                      seekToTime(currentTimeRef.current, true);
                     }}
                     onBlur={() => {
-                      isScrubbingRef.current = false;
+                      if (isScrubbingRef.current) {
+                        isScrubbingRef.current = false;
+                        seekToTime(currentTimeRef.current, true);
+                      }
                     }}
                     onChange={(e) => {
                       const val = parseFloat(e.target.value);
-                      seekToTime(val);
+                      seekToTime(val, !isScrubbingRef.current);
                     }}
                     className="rex-slider flex-1"
                   />
@@ -7873,16 +8038,21 @@ export default function App() {
               }}
               onPointerUp={() => {
                 isScrubbingRef.current = false;
+                seekToTime(currentTimeRef.current, true);
               }}
               onPointerCancel={() => {
                 isScrubbingRef.current = false;
+                seekToTime(currentTimeRef.current, true);
               }}
               onBlur={() => {
-                isScrubbingRef.current = false;
+                if (isScrubbingRef.current) {
+                  isScrubbingRef.current = false;
+                  seekToTime(currentTimeRef.current, true);
+                }
               }}
               onChange={(e) => {
                 const val = parseFloat(e.target.value);
-                seekToTime(val);
+                seekToTime(val, !isScrubbingRef.current);
               }}
               className="rex-slider"
             />
@@ -9905,14 +10075,14 @@ export default function App() {
                     <div className="rex-segmented">
                       {(
                         [
-                          { id: 'auto' as const, label: 'Авто' },
-                          { id: 2 as const, label: '2x Суб' },
-                          { id: 3 as const, label: '3x Суб' },
-                          { id: 4 as const, label: '4x Суб' }
+                          { id: 'auto' as const, label: `Авто (${effectiveSubframeCascadeMult}x)` },
+                          { id: '2x' as const, label: '2x Суб' },
+                          { id: '3x' as const, label: '3x Суб' },
+                          { id: '4x' as const, label: '4x Ультра' }
                         ]
                       ).map((m) => (
                         <button
-                          key={String(m.id)}
+                          key={m.id}
                           type="button"
                           onClick={() => {
                             setSubframeCascadeMode(m.id);

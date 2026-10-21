@@ -385,9 +385,15 @@ const STORE_VIDEOS = 'videos';
 const STORE_HANDLES = 'handles';
 const STORE_SUBTITLES = 'subtitles';
 
+let cachedVaultDbPromise: Promise<IDBDatabase> | null = null;
+
 function openMediaVaultDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (cachedVaultDbPromise) {
+    return cachedVaultDbPromise;
+  }
+  cachedVaultDbPromise = new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
+      cachedVaultDbPromise = null;
       reject(new Error('IndexedDB not supported'));
       return;
     }
@@ -404,9 +410,23 @@ function openMediaVaultDb(): Promise<IDBDatabase> {
         db.createObjectStore(STORE_SUBTITLES, { keyPath: 'id' });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => {
+        db.close();
+        cachedVaultDbPromise = null;
+      };
+      db.onclose = () => {
+        cachedVaultDbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      cachedVaultDbPromise = null;
+      reject(req.error);
+    };
   });
+  return cachedVaultDbPromise;
 }
 
 export async function saveVideoToVault(record: CachedVideoRecord): Promise<void> {
@@ -418,7 +438,6 @@ export async function saveVideoToVault(record: CachedVideoRecord): Promise<void>
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
   } catch {
     // Gracefully ignore if private browsing or storage limit reached
   }
@@ -450,7 +469,6 @@ export async function updateVideoMetaInVault(
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
   } catch {
     // Ignore
   }
@@ -465,7 +483,6 @@ export async function loadVideosFromVault(): Promise<CachedVideoRecord[]> {
       req.onsuccess = () => resolve((req.result as CachedVideoRecord[]) || []);
       req.onerror = () => reject(req.error);
     });
-    db.close();
     return records.sort((a, b) => b.addedAt - a.addedAt);
   } catch {
     return [];
@@ -481,7 +498,6 @@ export async function deleteVideoFromVault(id: string): Promise<void> {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
   } catch {
     // Ignore
   }
@@ -496,7 +512,6 @@ export async function clearVaultVideos(): Promise<void> {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
   } catch {
     // Ignore
   }
@@ -519,7 +534,6 @@ export async function saveDirectoryHandleToVault(
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
   } catch {
     // Ignore
   }
@@ -549,7 +563,6 @@ export async function loadDirectoryHandleFromVault(): Promise<{
       };
       req.onerror = () => reject(req.error);
     });
-    db.close();
     return res;
   } catch {
     return null;
@@ -570,7 +583,6 @@ export async function saveSubtitlesToVault(name: string, cues: SubtitleCue[]): P
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
   } catch {
     // Ignore
   }
@@ -596,7 +608,6 @@ export async function loadSubtitlesFromVault(): Promise<{
         req.onerror = () => reject(req.error);
       }
     );
-    db.close();
     return res;
   } catch {
     return null;
