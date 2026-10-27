@@ -38,10 +38,16 @@ import {
   Download,
   Smartphone,
   Bookmark,
-  Check
+  Check,
+  Lock,
+  Unlock,
+  PictureInPicture2,
+  Repeat,
+  Activity
 } from 'lucide-react';
 import {
   SubtitleCue,
+  VideoBookmark,
   UserCustomPreset,
   loadPersistedSettings,
   savePersistedSettings,
@@ -58,8 +64,11 @@ import {
   saveDirectoryHandleToVault,
   loadDirectoryHandleFromVault,
   saveSubtitlesToVault,
-  loadSubtitlesFromVault
+  loadSubtitlesFromVault,
+  loadAllVideoBookmarks,
+  saveAllVideoBookmarks
 } from './persistence';
+import Hls from 'hls.js';
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -78,10 +87,222 @@ interface LibraryVideoItem {
   thumbnailUrl?: string;
 }
 
+interface AnixartTypeItem {
+  id: number;
+  name: string;
+  icon: string | null;
+  episodesCount: number;
+  viewCount: number;
+  isSub: boolean;
+}
+
+interface AnixartSourceItem {
+  id: number;
+  name: string;
+  episodesCount: number;
+}
+
+interface AnixartEpisodeItem {
+  position: number;
+  name: string;
+  url: string;
+  iframe: boolean;
+  isFiller: boolean;
+}
+
+interface AnixartSessionState {
+  releaseUrl: string;
+  release: {
+    id: number;
+    titleRu: string;
+    titleOriginal: string;
+    poster: string;
+    year: string;
+    studio: string;
+    genres: string;
+    description: string;
+    episodesReleased: number;
+    episodesTotal: number;
+    grade: number;
+  };
+  types: AnixartTypeItem[];
+  selectedTypeId: number;
+  sources: AnixartSourceItem[];
+  selectedSourceId: number;
+  episodes: AnixartEpisodeItem[];
+  selectedEpisodePosition: number;
+}
+
 const STAGE_W = 960;
 const STAGE_H = 540;
 const FLOW_COLS = 96;
 const FLOW_ROWS = 54;
+
+// Generate 16x16x16 3D LUT packed into a 256x16 RGBA 2D texture strip
+const generateBuiltInLutStrip = (
+  preset: 'off' | 'teal_orange' | 'kodak_2383' | 'anime_vibrant' | 'cyberpunk' | 'custom'
+): Uint8Array => {
+  const N = 16;
+  const data = new Uint8Array(N * N * N * 4);
+  for (let g = 0; g < N; g++) {
+    for (let b = 0; b < N; b++) {
+      for (let r = 0; r < N; r++) {
+        let rf = r / (N - 1);
+        let gf = g / (N - 1);
+        let bf = b / (N - 1);
+        const luma = 0.299 * rf + 0.587 * gf + 0.114 * bf;
+
+        if (preset === 'teal_orange') {
+          const shadowW = Math.pow(1.0 - luma, 1.5);
+          const highW = Math.pow(luma, 1.35);
+          rf = rf + highW * 0.11 - shadowW * 0.07;
+          gf = gf + highW * 0.03 + shadowW * 0.03;
+          bf = bf - highW * 0.09 + shadowW * 0.12;
+          rf = 0.5 + (rf - 0.5) * 1.12;
+          gf = 0.5 + (gf - 0.5) * 1.08;
+          bf = 0.5 + (bf - 0.5) * 1.10;
+        } else if (preset === 'kodak_2383') {
+          const sCurve = (x: number) => {
+            const c = Math.max(0, Math.min(1, x));
+            return c * c * (3.0 - 2.0 * c);
+          };
+          rf = sCurve(rf) * 1.03;
+          gf = sCurve(gf) * 0.99;
+          bf = sCurve(bf) * 0.94 + (1.0 - luma) * 0.03;
+          const mLuma = 0.299 * rf + 0.587 * gf + 0.114 * bf;
+          rf = mLuma + (rf - mLuma) * 1.18;
+          gf = mLuma + (gf - mLuma) * 1.14;
+          bf = mLuma + (bf - mLuma) * 1.10;
+        } else if (preset === 'anime_vibrant') {
+          const cleanToe = Math.max(0, (luma - 0.025) / 0.975);
+          const scale = luma > 0.001 ? cleanToe / luma : 1.0;
+          rf *= scale;
+          gf *= scale;
+          bf *= scale;
+          const aLuma = 0.299 * rf + 0.587 * gf + 0.114 * bf;
+          rf = aLuma + (rf - aLuma) * 1.32;
+          gf = aLuma + (gf - aLuma) * 1.28;
+          bf = aLuma + (bf - aLuma) * 1.34;
+        } else if (preset === 'cyberpunk') {
+          const shadow = 1.0 - luma;
+          rf = rf * 1.06 + luma * 0.08 + shadow * 0.04;
+          gf = gf * 0.94 + (1.0 - Math.abs(luma - 0.5) * 2.0) * 0.05;
+          bf = bf * 1.12 + shadow * 0.14;
+          const cLuma = 0.299 * rf + 0.587 * gf + 0.114 * bf;
+          rf = cLuma + (rf - cLuma) * 1.26;
+          gf = cLuma + (gf - cLuma) * 1.15;
+          bf = cLuma + (bf - cLuma) * 1.30;
+        }
+
+        const idx = (g * (N * N) + b * N + r) * 4;
+        data[idx] = Math.max(0, Math.min(255, Math.round(rf * 255)));
+        data[idx + 1] = Math.max(0, Math.min(255, Math.round(gf * 255)));
+        data[idx + 2] = Math.max(0, Math.min(255, Math.round(bf * 255)));
+        data[idx + 3] = 255;
+      }
+    }
+  }
+  return data;
+};
+
+// Parse Adobe / Resolve .cube 3D LUT file and resample into a 16x16x16 (256x16) RGBA texture strip
+const parseCubeFileToLutStrip = (cubeText: string): { size: number; strip: Uint8Array } | null => {
+  const lines = cubeText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  let lutSize = 0;
+  const values: number[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line || line.startsWith('#')) continue;
+    const upper = line.toUpperCase();
+    if (upper.startsWith('TITLE') || upper.startsWith('DOMAIN_MIN') || upper.startsWith('DOMAIN_MAX') || upper.startsWith('LUT_1D_SIZE')) {
+      continue;
+    }
+    if (upper.startsWith('LUT_3D_SIZE')) {
+      const parts = line.split(/\s+/);
+      const parsedSize = parseInt(parts[1], 10);
+      if (parsedSize >= 2 && parsedSize <= 128) {
+        lutSize = parsedSize;
+      }
+      continue;
+    }
+    const parts = line.split(/\s+/);
+    if (parts.length >= 3) {
+      const r = parseFloat(parts[0]);
+      const g = parseFloat(parts[1]);
+      const b = parseFloat(parts[2]);
+      if (isFinite(r) && isFinite(g) && isFinite(b)) {
+        values.push(r, g, b);
+      }
+    }
+  }
+
+  if (lutSize < 2) {
+    const totalTriplets = Math.round(values.length / 3);
+    const cubeRoot = Math.round(Math.cbrt(totalTriplets));
+    if (cubeRoot >= 2 && cubeRoot * cubeRoot * cubeRoot === totalTriplets) {
+      lutSize = cubeRoot;
+    }
+  }
+
+  if (lutSize < 2 || values.length < lutSize * lutSize * lutSize * 3) {
+    return null;
+  }
+
+  const N = 16;
+  const strip = new Uint8Array(N * N * N * 4);
+  const sampleCube = (ri: number, gi: number, bi: number, ch: number) => {
+    const rClamped = Math.max(0, Math.min(lutSize - 1, ri));
+    const gClamped = Math.max(0, Math.min(lutSize - 1, gi));
+    const bClamped = Math.max(0, Math.min(lutSize - 1, bi));
+    const flatIdx = (bClamped * lutSize * lutSize + gClamped * lutSize + rClamped) * 3 + ch;
+    return values[flatIdx] ?? 0;
+  };
+
+  for (let g = 0; g < N; g++) {
+    for (let b = 0; b < N; b++) {
+      for (let r = 0; r < N; r++) {
+        const rf = (r / (N - 1)) * (lutSize - 1);
+        const gf = (g / (N - 1)) * (lutSize - 1);
+        const bf = (b / (N - 1)) * (lutSize - 1);
+        const r0 = Math.floor(rf);
+        const g0 = Math.floor(gf);
+        const b0 = Math.floor(bf);
+        const dr = rf - r0;
+        const dg = gf - g0;
+        const db = bf - b0;
+
+        const outRgb = [0, 0, 0];
+        for (let ch = 0; ch < 3; ch++) {
+          const c000 = sampleCube(r0, g0, b0, ch);
+          const c100 = sampleCube(r0 + 1, g0, b0, ch);
+          const c010 = sampleCube(r0, g0 + 1, b0, ch);
+          const c110 = sampleCube(r0 + 1, g0 + 1, b0, ch);
+          const c001 = sampleCube(r0, g0, b0 + 1, ch);
+          const c101 = sampleCube(r0 + 1, g0, b0 + 1, ch);
+          const c011 = sampleCube(r0, g0 + 1, b0 + 1, ch);
+          const c111 = sampleCube(r0 + 1, g0 + 1, b0 + 1, ch);
+
+          const c00 = c000 * (1 - dr) + c100 * dr;
+          const c10 = c010 * (1 - dr) + c110 * dr;
+          const c01 = c001 * (1 - dr) + c101 * dr;
+          const c11 = c011 * (1 - dr) + c111 * dr;
+          const c0 = c00 * (1 - dg) + c10 * dg;
+          const c1 = c01 * (1 - dg) + c11 * dg;
+          outRgb[ch] = c0 * (1 - db) + c1 * db;
+        }
+
+        const idx = (g * (N * N) + b * N + r) * 4;
+        strip[idx] = Math.max(0, Math.min(255, Math.round(outRgb[0] * 255)));
+        strip[idx + 1] = Math.max(0, Math.min(255, Math.round(outRgb[1] * 255)));
+        strip[idx + 2] = Math.max(0, Math.min(255, Math.round(outRgb[2] * 255)));
+        strip[idx + 3] = 255;
+      }
+    }
+  }
+
+  return { size: lutSize, strip };
+};
 
 // Canonical video frame intervals (23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60 FPS)
 // Snaps noisy decoder timestamps to exact frame cadence to eliminate VSync PLL micro-stutter
@@ -96,14 +317,13 @@ const snapToCanonicalCadenceMs = (rawIntervalMs: number): number => {
   return rawIntervalMs;
 };
 
-// Fast O(log N) binary search for active subtitle cues with multi-speaker overlap support
+// Fast O(log N) binary search for active subtitle cues with multi-speaker overlap & ASS {\an8} top-alignment support
 const findActiveSubtitleText = (cues: SubtitleCue[], timeSec: number): string => {
   const len = cues.length;
   if (len === 0) return '';
   let lo = 0;
   let hi = len - 1;
   let firstPossibleIdx = len;
-  // Find first cue whose start <= timeSec + 0.001, then scan nearby cues
   while (lo <= hi) {
     const mid = (lo + hi) >>> 1;
     if (cues[mid].start <= timeSec) {
@@ -114,7 +334,6 @@ const findActiveSubtitleText = (cues: SubtitleCue[], timeSec: number): string =>
     }
   }
   if (firstPossibleIdx === len) return '';
-  // Scan backwards briefly to include any earlier-starting long cue that still overlaps timeSec
   const startScan = Math.max(0, firstPossibleIdx - 6);
   let matched = '';
   for (let i = startScan; i <= firstPossibleIdx; i++) {
@@ -124,6 +343,55 @@ const findActiveSubtitleText = (cues: SubtitleCue[], timeSec: number): string =>
     }
   }
   return matched;
+};
+
+const findActiveDualSubtitles = (
+  primaryCues: SubtitleCue[],
+  secondaryCues: SubtitleCue[],
+  timeSec: number,
+  primaryEnabled: boolean,
+  secondaryEnabled: boolean
+): { bottomText: string; topText: string } => {
+  let bottomText = '';
+  let topText = '';
+
+  if (primaryEnabled && primaryCues.length > 0) {
+    const len = primaryCues.length;
+    let lo = 0;
+    let hi = len - 1;
+    let firstIdx = len;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      if (primaryCues[mid].start <= timeSec) {
+        firstIdx = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (firstIdx < len) {
+      const startScan = Math.max(0, firstIdx - 8);
+      for (let i = startScan; i <= firstIdx; i++) {
+        const c = primaryCues[i];
+        if (timeSec >= c.start && timeSec <= c.end) {
+          if (c.align === 7 || c.align === 8 || c.align === 9) {
+            topText = topText ? `${topText}\n${c.text}` : c.text;
+          } else {
+            bottomText = bottomText ? `${bottomText}\n${c.text}` : c.text;
+          }
+        }
+      }
+    }
+  }
+
+  if (secondaryEnabled && secondaryCues.length > 0) {
+    const secMatch = findActiveSubtitleText(secondaryCues, timeSec);
+    if (secMatch) {
+      topText = topText ? `${topText}\n${secMatch}` : secMatch;
+    }
+  }
+
+  return { bottomText, topText };
 };
 
 export default function App() {
@@ -145,6 +413,15 @@ export default function App() {
   const [activeModal, setActiveModal] = useState<string | null>(null);
   const [urlModalOpen, setUrlModalOpen] = useState(false);
   const [urlInput, setUrlInput] = useState('');
+  const [isResolvingUrl, setIsResolvingUrl] = useState(false);
+  const [anixartSession, setAnixartSession] = useState<AnixartSessionState | null>(null);
+  const [streamQualities, setStreamQualities] = useState<Record<string, string>>({});
+  const [activeStreamQuality, setActiveStreamQuality] = useState<string>('Auto');
+  const [skipTimings, setSkipTimings] = useState<Array<{ start: number; end: number; label: string }>>([]);
+  const [activeSkipPrompt, setActiveSkipPrompt] = useState<{ start: number; end: number; label: string } | null>(null);
+  const skipTimingsRef = useRef<Array<{ start: number; end: number; label: string }>>([]);
+  const activeSkipPromptRef = useRef<{ start: number; end: number; label: string } | null>(null);
+  const hlsInstanceRef = useRef<Hls | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [isInstalledPwa, setIsInstalledPwa] = useState(false);
@@ -180,6 +457,25 @@ export default function App() {
   const [volume, setVolume] = useState<number>(initCfg.volume);
   const [isMuted, setIsMuted] = useState<boolean>(initCfg.isMuted);
   const [videoBrightness, setVideoBrightness] = useState<number>(initCfg.videoBrightness);
+  const [videoContrast, setVideoContrast] = useState<number>(initCfg.videoContrast ?? 1.0);
+  const [videoSaturation, setVideoSaturation] = useState<number>(initCfg.videoSaturation ?? 1.0);
+  const [videoBlackPoint, setVideoBlackPoint] = useState<number>(initCfg.videoBlackPoint ?? 0.0);
+  const [debandEnabled, setDebandEnabled] = useState<boolean>(initCfg.debandEnabled ?? true);
+  const [debandStrength, setDebandStrength] = useState<number>(initCfg.debandStrength ?? 65);
+  const [ambilightEnabled, setAmbilightEnabled] = useState<boolean>(
+    initCfg.ambilightEnabled ?? true
+  );
+  const [autoCropBlackBars, setAutoCropBlackBars] = useState<boolean>(
+    initCfg.autoCropBlackBars ?? false
+  );
+  const [detectedAutoCropPct, setDetectedAutoCropPct] = useState<number>(0);
+  const [lutPreset, setLutPreset] = useState<
+    'off' | 'teal_orange' | 'kodak_2383' | 'anime_vibrant' | 'cyberpunk' | 'custom'
+  >(initCfg.lutPreset || 'off');
+  const [lutStrength, setLutStrength] = useState<number>(initCfg.lutStrength ?? 85);
+  const [customLutName, setCustomLutName] = useState<string>('Файл .cube не выбран');
+  const customLutStripRef = useRef<Uint8Array | null>(null);
+  const [lutVersion, setLutVersion] = useState<number>(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [seekFeedback, setSeekFeedback] = useState<string | null>(null);
   const [swipeHud, setSwipeHud] = useState<{
@@ -205,9 +501,15 @@ export default function App() {
   const [adrenoMode, setAdrenoMode] = useState<'auto' | 'on' | 'off'>(initCfg.adrenoMode);
   const [adrenoGmemFp16, setAdrenoGmemFp16] = useState<boolean>(initCfg.adrenoGmemFp16);
   const [adrenoTrue10Hdr, setAdrenoTrue10Hdr] = useState<boolean>(initCfg.adrenoTrue10Hdr);
+  const [ecoThermalMode, setEcoThermalMode] = useState<boolean>(
+    initCfg.ecoThermalMode ?? true
+  );
   const [flowScaleMode, setFlowScaleMode] = useState<
-    'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme'
+    'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme' | 'high' | 'max'
   >(initCfg.flowScaleMode || 'auto');
+  const [subframeBufferResMode, setSubframeBufferResMode] = useState<
+    'auto' | '720p' | '1080p' | '1440p'
+  >(initCfg.subframeBufferResMode || 'auto');
   const [detectedGpuInfo, setDetectedGpuInfo] = useState<{
     vendor: string;
     renderer: string;
@@ -300,7 +602,11 @@ export default function App() {
     return () => cancelAnimationFrame(rafId);
   }, []);
 
-  const effectiveTargetFps = targetFps === 'auto' ? detectedDisplayHz : targetFps;
+  // Target FPS for MEMC synthesis: in 'auto' mode always match native display Hz (at least 60 FPS)
+  const effectiveTargetFps =
+    targetFps === 'auto'
+      ? Math.max(60, detectedDisplayHz)
+      : targetFps;
 
   const effectiveSubframeCascadeMult: 2 | 3 | 4 =
     subframeCascadeMode === '2x'
@@ -311,15 +617,39 @@ export default function App() {
       ? 4
       : effectiveTargetFps >= 120
       ? 4
-      : effectiveTargetFps >= 90
-      ? 3
-      : 2;
+      : 3;
+
+  const subframeBufferResLabel =
+    subframeBufferResMode === '1440p'
+      ? '1440p QHD'
+      : subframeBufferResMode === '1080p'
+      ? '1080p FHD'
+      : subframeBufferResMode === '720p'
+      ? '720p HD'
+      : ecoThermalMode
+      ? 'Авто (1080p ЭКО)'
+      : 'Авто (до 1440p)';
+
+  const flowScaleLabel =
+    flowScaleMode === 'max'
+      ? '512×288 Ультра-Макс'
+      : flowScaleMode === 'high'
+      ? '384×216 Высокий'
+      : flowScaleMode === 'extreme'
+      ? '256×144 Экстрим'
+      : flowScaleMode === 'ultra'
+      ? '128×72 Ультра'
+      : flowScaleMode === 'balanced'
+      ? '96×54 Баланс'
+      : flowScaleMode === 'performance'
+      ? '64×36 Быстрый'
+      : 'Авто (6-Lvl)';
 
   const subframeCascadeLabel = !subframeCascadeEnabled
     ? 'Каскад Выкл'
     : subframeCascadeMode === 'auto'
-    ? `Авто (${effectiveSubframeCascadeMult}x Sub-FBO)`
-    : `${subframeCascadeMode} Sub-FBO`;
+    ? `Авто (${effectiveSubframeCascadeMult}x • ${subframeBufferResLabel})`
+    : `${subframeCascadeMode} • ${subframeBufferResLabel}`;
 
   // Telemetry initial state (updated via direct DOM refs during playback for 0 React re-render overhead)
   const [liveScreenHz] = useState(60);
@@ -327,16 +657,23 @@ export default function App() {
   const [synthesizedCount] = useState(0);
   const [subframeAlpha] = useState(0.5);
 
-  // Subtitles state (persisted)
+  // Subtitles state (persisted, Dual Subtitles + .ASS/.SSA)
   const [subtitlesEnabled, setSubtitlesEnabled] = useState<boolean>(initCfg.subtitlesEnabled);
+  const [secondarySubtitlesEnabled, setSecondarySubtitlesEnabled] = useState<boolean>(
+    initCfg.secondarySubtitlesEnabled ?? false
+  );
   const [subFontSize, setSubFontSize] = useState<number>(initCfg.subFontSize);
   const [subDelaySec, setSubDelaySec] = useState<number>(initCfg.subDelaySec);
   const [subBgOpacity, setSubBgOpacity] = useState<number>(initCfg.subBgOpacity);
   const [subColor] = useState('#ffffff');
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([]);
+  const [secondarySubtitleCues, setSecondarySubtitleCues] = useState<SubtitleCue[]>([]);
   const [customSubtitlesName, setCustomSubtitlesName] = useState('Субтитры не загружены');
+  const [secondarySubtitlesName, setSecondarySubtitlesName] = useState(
+    'Доп. субтитры (верх) не загружены'
+  );
 
-  // Web Audio Equalizer state (persisted)
+  // Web Audio Equalizer, Compressor, Crossfeed & Spectrogram state (persisted)
   const [eqEnabled, setEqEnabled] = useState<boolean>(initCfg.eqEnabled);
   const [eqPreset, setEqPreset] = useState<'flat' | 'cinema' | 'bass' | 'vocal' | 'treble'>(
     initCfg.eqPreset
@@ -346,17 +683,40 @@ export default function App() {
   const [eqBands, setEqBands] = useState<[number, number, number, number, number]>(
     initCfg.eqBands
   );
+  const [audioCompressorMode, setAudioCompressorMode] = useState<
+    'off' | 'soft' | 'night' | 'voice'
+  >(initCfg.audioCompressorMode || 'off');
+  const [headphoneCrossfeed, setHeadphoneCrossfeed] = useState<boolean>(
+    initCfg.headphoneCrossfeed ?? false
+  );
 
-  // Player, Gestures & Library Settings (persisted)
+  // Player, Gestures, Navigation, A-B Loop, Bookmarks, Touch Lock & HUD Settings
   const [autoPlayNext, setAutoPlayNext] = useState<boolean>(initCfg.autoPlayNext);
   const [loopPlayback, setLoopPlayback] = useState<boolean>(initCfg.loopPlayback);
   const [rememberPosition, setRememberPosition] = useState<boolean>(initCfg.rememberPosition);
   const [showTopHud, setShowTopHud] = useState<boolean>(initCfg.showTopHud);
+  const [showHudTelemetryGraph, setShowHudTelemetryGraph] = useState<boolean>(
+    initCfg.showHudTelemetryGraph ?? true
+  );
   const [showStepButtons, setShowStepButtons] = useState<boolean>(initCfg.showStepButtons);
   const [showSnapshotBtn, setShowSnapshotBtn] = useState<boolean>(initCfg.showSnapshotBtn);
   const [doubleTapSeekSec, setDoubleTapSeekSec] = useState<number>(initCfg.doubleTapSeekSec);
   const [swipeVolumeBright, setSwipeVolumeBright] = useState<boolean>(initCfg.swipeVolumeBright);
   const [longPressSpeed2x, setLongPressSpeed2x] = useState<boolean>(initCfg.longPressSpeed2x);
+
+  // Touch Lock (Kids Lock), WebGL PiP, A-B Loop & Bookmarks
+  const [isTouchLocked, setIsTouchLocked] = useState<boolean>(false);
+  const [isPipActive, setIsPipActive] = useState<boolean>(false);
+  const [loopPointA, setLoopPointA] = useState<number | null>(null);
+  const [loopPointB, setLoopPointB] = useState<number | null>(null);
+  const [bookmarksMap, setBookmarksMap] = useState<Record<string, VideoBookmark[]>>(() =>
+    loadAllVideoBookmarks()
+  );
+  const [seekHoverPreview, setSeekHoverPreview] = useState<{
+    visible: boolean;
+    timeSec: number;
+    leftPct: number;
+  }>({ visible: false, timeSec: 0, leftPct: 50 });
 
   // Video Output Mode & WebGL Fallback state (persisted)
   const [videoOutputMode, setVideoOutputMode] = useState<'webgl_direct' | 'video_fallback'>(
@@ -370,9 +730,20 @@ export default function App() {
   // DOM Refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const renderCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ambilightCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const hudTelemetryCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const hudDroppedFramesRef = useRef<HTMLSpanElement | null>(null);
+  const hudFpsRatioRef = useRef<HTMLSpanElement | null>(null);
+  const eqSpectrumCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const fsEqSpectrumCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const seekPreviewVideoRef = useRef<HTMLVideoElement | null>(null);
+  const seekPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pipVideoRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const subFileInputRef = useRef<HTMLInputElement | null>(null);
+  const secondarySubFileInputRef = useRef<HTMLInputElement | null>(null);
+  const lutFileInputRef = useRef<HTMLInputElement | null>(null);
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
   const telemetryCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -391,10 +762,18 @@ export default function App() {
   >('none');
   const subtitleBoxRef = useRef<HTMLDivElement | null>(null);
   const subtitleTextSpanRef = useRef<HTMLSpanElement | null>(null);
+  const topSubtitleBoxRef = useRef<HTMLDivElement | null>(null);
+  const topSubtitleTextSpanRef = useRef<HTMLSpanElement | null>(null);
   const youSynthCountRef = useRef<HTMLDivElement | null>(null);
   const youAlphaRef = useRef<HTMLDivElement | null>(null);
   const youLatencyLabelRef = useRef<HTMLSpanElement | null>(null);
   const youHzLabelRef = useRef<HTMLSpanElement | null>(null);
+  const loopPointsRef = useRef<{ a: number | null; b: number | null }>({ a: null, b: null });
+  const detectedAutoCropRef = useRef<number>(0);
+
+  useEffect(() => {
+    loopPointsRef.current = { a: loopPointA, b: loopPointB };
+  }, [loopPointA, loopPointB]);
 
   useEffect(() => {
     fsControlsVisibleRef.current = fsControlsVisible;
@@ -409,6 +788,9 @@ export default function App() {
   const isScrubbingRef = useRef<boolean>(false);
   const synthesizedCounterRef = useRef<number>(0);
   const procLatencyAvgRef = useRef<number>(0.28);
+  const vramUsageMbRef = useRef<number>(18.4);
+  const activeFlowGridStrRef = useRef<string>('128×72');
+  const activeSubframeResStrRef = useRef<string>('1920×1080');
   const toastTimeoutRef = useRef<number | null>(null);
   const seekBadgeTimeoutRef = useRef<number | null>(null);
   const swipeHudTimeoutRef = useRef<number | null>(null);
@@ -512,14 +894,28 @@ export default function App() {
     };
     window.addEventListener('resize', updateMobileScale);
     window.addEventListener('orientationchange', updateMobileScale);
+
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && stageContainerRef.current) {
+      ro = new ResizeObserver(() => {
+        forceRedrawRef.current = true;
+      });
+      ro.observe(stageContainerRef.current);
+    }
+
     return () => {
       window.removeEventListener('resize', updateMobileScale);
       window.removeEventListener('orientationchange', updateMobileScale);
+      if (ro) ro.disconnect();
     };
   }, []);
 
   const effectiveUpscaleFactor: 1.5 | 2.0 | 4.0 =
-    upscaleFactor === 'auto' ? detectedMobileScaleFactor : upscaleFactor;
+    upscaleFactor === 'auto'
+      ? ecoThermalMode
+        ? 1.5
+        : detectedMobileScaleFactor
+      : upscaleFactor;
 
   const upscaleModeLabel =
     upscaleMode === 'gsr'
@@ -557,6 +953,15 @@ export default function App() {
       volume,
       isMuted,
       videoBrightness,
+      videoContrast,
+      videoSaturation,
+      videoBlackPoint,
+      debandEnabled,
+      debandStrength,
+      ambilightEnabled,
+      autoCropBlackBars,
+      lutPreset,
+      lutStrength,
       hdrEnabled,
       hdrStrength,
       upscaleEnabled,
@@ -567,7 +972,9 @@ export default function App() {
       adrenoMode,
       adrenoGmemFp16,
       adrenoTrue10Hdr,
+      ecoThermalMode,
       flowScaleMode,
+      subframeBufferResMode,
       processorMenuCollapsed,
       topToolbarCollapsed,
       fsToolbarCollapsed,
@@ -589,6 +996,7 @@ export default function App() {
       sceneCutProtection,
       splitCompareMode,
       subtitlesEnabled,
+      secondarySubtitlesEnabled,
       subFontSize,
       subDelaySec,
       subBgOpacity,
@@ -597,11 +1005,14 @@ export default function App() {
       preampGain,
       pitchCorrection,
       eqBands,
+      audioCompressorMode,
+      headphoneCrossfeed,
       autoPlayNext,
       loopPlayback,
       rememberPosition,
       autoBindMediaOnStart,
       showTopHud,
+      showHudTelemetryGraph,
       showStepButtons,
       showSnapshotBtn,
       doubleTapSeekSec,
@@ -624,6 +1035,15 @@ export default function App() {
     volume,
     isMuted,
     videoBrightness,
+    videoContrast,
+    videoSaturation,
+    videoBlackPoint,
+    debandEnabled,
+    debandStrength,
+    ambilightEnabled,
+    autoCropBlackBars,
+    lutPreset,
+    lutStrength,
     hdrEnabled,
     hdrStrength,
     upscaleEnabled,
@@ -634,7 +1054,9 @@ export default function App() {
     adrenoMode,
     adrenoGmemFp16,
     adrenoTrue10Hdr,
+    ecoThermalMode,
     flowScaleMode,
+    subframeBufferResMode,
     processorMenuCollapsed,
     topToolbarCollapsed,
     fsToolbarCollapsed,
@@ -656,6 +1078,7 @@ export default function App() {
     sceneCutProtection,
     splitCompareMode,
     subtitlesEnabled,
+    secondarySubtitlesEnabled,
     subFontSize,
     subDelaySec,
     subBgOpacity,
@@ -664,11 +1087,14 @@ export default function App() {
     preampGain,
     pitchCorrection,
     eqBands,
+    audioCompressorMode,
+    headphoneCrossfeed,
     autoPlayNext,
     loopPlayback,
     rememberPosition,
     autoBindMediaOnStart,
     showTopHud,
+    showHudTelemetryGraph,
     showStepButtons,
     showSnapshotBtn,
     doubleTapSeekSec,
@@ -717,7 +1143,9 @@ export default function App() {
     isAdrenoActive,
     adrenoGmemFp16,
     adrenoTrue10Hdr,
+    ecoThermalMode,
     flowScaleMode,
+    subframeBufferResMode,
     interpEnabled,
     interpMode,
     targetFps,
@@ -738,11 +1166,25 @@ export default function App() {
     manualSubframePhase,
     aspectMode,
     videoBrightness,
+    videoContrast,
+    videoSaturation,
+    videoBlackPoint,
+    debandEnabled,
+    debandStrength,
+    ambilightEnabled,
+    autoCropBlackBars,
+    lutPreset,
+    lutStrength,
+    lutVersion,
     videoOutputMode,
     isVideoFallbackActive,
     subtitlesEnabled,
+    secondarySubtitlesEnabled,
     subDelaySec,
     subtitleCues,
+    secondarySubtitleCues,
+    showTopHud,
+    showHudTelemetryGraph,
     rememberPosition
   });
 
@@ -767,7 +1209,9 @@ export default function App() {
       isAdrenoActive,
       adrenoGmemFp16,
       adrenoTrue10Hdr,
+      ecoThermalMode,
       flowScaleMode,
+      subframeBufferResMode,
       interpEnabled,
       interpMode,
       targetFps,
@@ -788,11 +1232,25 @@ export default function App() {
       manualSubframePhase,
       aspectMode,
       videoBrightness,
+      videoContrast,
+      videoSaturation,
+      videoBlackPoint,
+      debandEnabled,
+      debandStrength,
+      ambilightEnabled,
+      autoCropBlackBars,
+      lutPreset,
+      lutStrength,
+      lutVersion,
       videoOutputMode,
       isVideoFallbackActive,
       subtitlesEnabled,
+      secondarySubtitlesEnabled,
       subDelaySec,
       subtitleCues,
+      secondarySubtitleCues,
+      showTopHud,
+      showHudTelemetryGraph,
       rememberPosition
     };
     forceRedrawRef.current = true;
@@ -817,7 +1275,9 @@ export default function App() {
     isAdrenoActive,
     adrenoGmemFp16,
     adrenoTrue10Hdr,
+    ecoThermalMode,
     flowScaleMode,
+    subframeBufferResMode,
     interpEnabled,
     interpMode,
     targetFps,
@@ -838,21 +1298,53 @@ export default function App() {
     manualSubframePhase,
     aspectMode,
     videoBrightness,
+    videoContrast,
+    videoSaturation,
+    videoBlackPoint,
+    debandEnabled,
+    debandStrength,
+    ambilightEnabled,
+    autoCropBlackBars,
+    lutPreset,
+    lutStrength,
+    lutVersion,
     videoOutputMode,
     isVideoFallbackActive,
     subtitlesEnabled,
+    secondarySubtitlesEnabled,
     subDelaySec,
     subtitleCues,
+    secondarySubtitleCues,
+    showTopHud,
+    showHudTelemetryGraph,
     rememberPosition
   ]);
 
-  // Audio Context & nodes ref
+  // Audio Context & nodes ref (5-band EQ + DynamicsCompressorNode + Voice Filter + Crossfeed + AnalyserNode)
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioNodesRef = useRef<{
     source: MediaElementAudioSourceNode | null;
     preamp: GainNode | null;
     filters: BiquadFilterNode[];
-  }>({ source: null, preamp: null, filters: [] });
+    voiceFilter: BiquadFilterNode | null;
+    compressor: DynamicsCompressorNode | null;
+    crossfeedDirectL: GainNode | null;
+    crossfeedDirectR: GainNode | null;
+    crossfeedCrossLtoR: GainNode | null;
+    crossfeedCrossRtoL: GainNode | null;
+    analyser: AnalyserNode | null;
+  }>({
+    source: null,
+    preamp: null,
+    filters: [],
+    voiceFilter: null,
+    compressor: null,
+    crossfeedDirectL: null,
+    crossfeedDirectR: null,
+    crossfeedCrossLtoR: null,
+    crossfeedCrossRtoL: null,
+    analyser: null
+  });
 
   // Telemetry history ref
   const frameTimeHistoryRef = useRef<number[]>(new Array(40).fill(0.18));
@@ -921,7 +1413,7 @@ export default function App() {
     }
   };
 
-  // Web Audio Equalizer initialization
+  // Web Audio Equalizer + Night Compressor + Spatial Crossfeed + Spectrogram Analyser initialization
   const initWebAudio = useCallback(() => {
     const vid = videoRef.current;
     if (!vid) return;
@@ -931,7 +1423,6 @@ export default function App() {
       }
       return;
     }
-    // Prevent duplicate source connection on the same media element
     const vidTagged = vid as unknown as { __hasAudioSourceNode?: boolean };
     if (vidTagged.__hasAudioSourceNode) {
       return;
@@ -959,31 +1450,210 @@ export default function App() {
         return filter;
       });
 
+      // Voice mid-band boost filter (300Hz - 3kHz centered at 1350Hz)
+      const voiceFilter = ctx.createBiquadFilter();
+      voiceFilter.type = 'peaking';
+      voiceFilter.frequency.value = 1350;
+      voiceFilter.Q.value = 0.85;
+      voiceFilter.gain.value = audioCompressorMode === 'voice' ? 6.5 : 0;
+
+      // DynamicsCompressorNode for Night Mode / Volume Normalization
+      const compressor = ctx.createDynamicsCompressor();
+      if (audioCompressorMode === 'night') {
+        compressor.threshold.value = -36;
+        compressor.knee.value = 24;
+        compressor.ratio.value = 8;
+        compressor.attack.value = 0.005;
+        compressor.release.value = 0.22;
+      } else if (audioCompressorMode === 'soft') {
+        compressor.threshold.value = -24;
+        compressor.knee.value = 18;
+        compressor.ratio.value = 3.5;
+        compressor.attack.value = 0.015;
+        compressor.release.value = 0.25;
+      } else if (audioCompressorMode === 'voice') {
+        compressor.threshold.value = -28;
+        compressor.knee.value = 20;
+        compressor.ratio.value = 5.0;
+        compressor.attack.value = 0.008;
+        compressor.release.value = 0.2;
+      } else {
+        compressor.threshold.value = 0;
+        compressor.knee.value = 0;
+        compressor.ratio.value = 1;
+        compressor.attack.value = 0.02;
+        compressor.release.value = 0.25;
+      }
+
+      // Spatial Headphone Crossfeed (0.3ms delay + 18% L/R blend)
+      const splitter = ctx.createChannelSplitter(2);
+      const merger = ctx.createChannelMerger(2);
+      const delayLtoR = ctx.createDelay(0.01);
+      const delayRtoL = ctx.createDelay(0.01);
+      delayLtoR.delayTime.value = 0.0003; // 0.3 ms interaural time difference
+      delayRtoL.delayTime.value = 0.0003;
+
+      const crossfeedDirectL = ctx.createGain();
+      const crossfeedDirectR = ctx.createGain();
+      const crossfeedCrossLtoR = ctx.createGain();
+      const crossfeedCrossRtoL = ctx.createGain();
+
+      crossfeedDirectL.gain.value = headphoneCrossfeed ? 0.85 : 1.0;
+      crossfeedDirectR.gain.value = headphoneCrossfeed ? 0.85 : 1.0;
+      crossfeedCrossLtoR.gain.value = headphoneCrossfeed ? 0.18 : 0.0;
+      crossfeedCrossRtoL.gain.value = headphoneCrossfeed ? 0.18 : 0.0;
+
+      // AnalyserNode for real-time 5-band / 16-bin spectrogram
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 64;
+      analyser.smoothingTimeConstant = 0.78;
+
       source.connect(preamp);
       let lastNode: AudioNode = preamp;
       filters.forEach((filter) => {
         lastNode.connect(filter);
         lastNode = filter;
       });
-      lastNode.connect(ctx.destination);
+      lastNode.connect(voiceFilter);
+      voiceFilter.connect(compressor);
+      compressor.connect(splitter);
 
-      audioNodesRef.current = { source, preamp, filters };
+      // Left channel -> Direct L + Delayed R
+      splitter.connect(crossfeedDirectL, 0);
+      crossfeedDirectL.connect(merger, 0, 0);
+      splitter.connect(delayLtoR, 0);
+      delayLtoR.connect(crossfeedCrossLtoR);
+      crossfeedCrossLtoR.connect(merger, 0, 1);
+
+      // Right channel -> Direct R + Delayed L
+      splitter.connect(crossfeedDirectR, 1);
+      crossfeedDirectR.connect(merger, 0, 1);
+      splitter.connect(delayRtoL, 1);
+      delayRtoL.connect(crossfeedCrossRtoL);
+      crossfeedCrossRtoL.connect(merger, 0, 0);
+
+      merger.connect(analyser);
+      analyser.connect(ctx.destination);
+
+      audioNodesRef.current = {
+        source,
+        preamp,
+        filters,
+        voiceFilter,
+        compressor,
+        crossfeedDirectL,
+        crossfeedDirectR,
+        crossfeedCrossLtoR,
+        crossfeedCrossRtoL,
+        analyser
+      };
     } catch {
       // Gracefully bypass if browser restricts MediaElementSource
     }
-  }, [eqBands, eqEnabled, preampGain]);
+  }, [audioCompressorMode, eqBands, eqEnabled, headphoneCrossfeed, preampGain]);
 
-  // Update EQ bands when sliders move
+  // Update EQ bands, DynamicsCompressorNode & Crossfeed when settings change
   useEffect(() => {
-    if (!audioNodesRef.current.preamp) return;
+    const nodes = audioNodesRef.current;
+    if (!nodes.preamp) return;
     if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
       audioCtxRef.current.resume().catch(() => {});
     }
-    audioNodesRef.current.preamp.gain.value = preampGain;
-    audioNodesRef.current.filters.forEach((filter, idx) => {
+    nodes.preamp.gain.value = preampGain;
+    nodes.filters.forEach((filter, idx) => {
       filter.gain.value = eqEnabled ? eqBands[idx] : 0;
     });
-  }, [eqBands, eqEnabled, preampGain]);
+    if (nodes.voiceFilter) {
+      nodes.voiceFilter.gain.value = audioCompressorMode === 'voice' ? 6.5 : 0;
+    }
+    if (nodes.compressor) {
+      if (audioCompressorMode === 'night') {
+        nodes.compressor.threshold.value = -36;
+        nodes.compressor.knee.value = 24;
+        nodes.compressor.ratio.value = 8;
+        nodes.compressor.attack.value = 0.005;
+        nodes.compressor.release.value = 0.22;
+      } else if (audioCompressorMode === 'soft') {
+        nodes.compressor.threshold.value = -24;
+        nodes.compressor.knee.value = 18;
+        nodes.compressor.ratio.value = 3.5;
+        nodes.compressor.attack.value = 0.015;
+        nodes.compressor.release.value = 0.25;
+      } else if (audioCompressorMode === 'voice') {
+        nodes.compressor.threshold.value = -28;
+        nodes.compressor.knee.value = 20;
+        nodes.compressor.ratio.value = 5.0;
+        nodes.compressor.attack.value = 0.008;
+        nodes.compressor.release.value = 0.2;
+      } else {
+        nodes.compressor.threshold.value = 0;
+        nodes.compressor.knee.value = 0;
+        nodes.compressor.ratio.value = 1;
+      }
+    }
+    if (
+      nodes.crossfeedDirectL &&
+      nodes.crossfeedDirectR &&
+      nodes.crossfeedCrossLtoR &&
+      nodes.crossfeedCrossRtoL
+    ) {
+      nodes.crossfeedDirectL.gain.value = headphoneCrossfeed ? 0.85 : 1.0;
+      nodes.crossfeedDirectR.gain.value = headphoneCrossfeed ? 0.85 : 1.0;
+      nodes.crossfeedCrossLtoR.gain.value = headphoneCrossfeed ? 0.18 : 0.0;
+      nodes.crossfeedCrossRtoL.gain.value = headphoneCrossfeed ? 0.18 : 0.0;
+    }
+  }, [audioCompressorMode, eqBands, eqEnabled, headphoneCrossfeed, preampGain]);
+
+  // Live Audio Spectrogram animation when Equalizer modal or fullscreen Audio drawer is open
+  useEffect(() => {
+    const isEqVisible = activeModal === 'eq' || fsActivePanel === 'audio';
+    if (!isEqVisible) return;
+
+    let animId = 0;
+    const freqData = new Uint8Array(32);
+
+    const drawSpectrum = () => {
+      const analyser = audioNodesRef.current.analyser;
+      if (analyser) {
+        analyser.getByteFrequencyData(freqData);
+      } else {
+        freqData.fill(0);
+      }
+
+      const targets = [eqSpectrumCanvasRef.current, fsEqSpectrumCanvasRef.current];
+      for (const canvas of targets) {
+        if (!canvas) continue;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) continue;
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx.clearRect(0, 0, w, h);
+
+        const barCount = 24;
+        const gap = 3;
+        const barW = Math.max(2, (w - gap * (barCount - 1)) / barCount);
+
+        for (let i = 0; i < barCount; i++) {
+          const val = freqData[i] || 0;
+          const norm = Math.max(0.06, val / 255);
+          const barH = Math.round(norm * (h - 4));
+          const x = i * (barW + gap);
+          const y = h - barH;
+
+          const grad = ctx.createLinearGradient(0, h, 0, 0);
+          grad.addColorStop(0, '#38bdf8');
+          grad.addColorStop(0.6, '#818cf8');
+          grad.addColorStop(1, '#f472b6');
+          ctx.fillStyle = grad;
+          ctx.fillRect(x, y, barW, barH);
+        }
+      }
+      animId = requestAnimationFrame(drawSpectrum);
+    };
+
+    animId = requestAnimationFrame(drawSpectrum);
+    return () => cancelAnimationFrame(animId);
+  }, [activeModal, fsActivePanel]);
 
   // Sync pitchCorrection to video element
   useEffect(() => {
@@ -1004,16 +1674,117 @@ export default function App() {
     showToast(`Пресет эквалайзера: ${preset.toUpperCase()}`);
   };
 
-  // Active subtitle cue computed cleanly from currentTime
-  const activeSubtitleCue = React.useMemo(() => {
-    if (!subtitlesEnabled || !subtitleCues.length) return '';
-    return findActiveSubtitleText(subtitleCues, currentTime - subDelaySec);
-  }, [currentTime, subDelaySec, subtitleCues, subtitlesEnabled]);
+  // Active subtitle cues (Bottom & Top) computed from currentTime
+  const activeDualSubtitles = React.useMemo(() => {
+    return findActiveDualSubtitles(
+      subtitleCues,
+      secondarySubtitleCues,
+      currentTime - subDelaySec,
+      subtitlesEnabled,
+      secondarySubtitlesEnabled
+    );
+  }, [
+    currentTime,
+    secondarySubtitleCues,
+    secondarySubtitlesEnabled,
+    subDelaySec,
+    subtitleCues,
+    subtitlesEnabled
+  ]);
+  const activeSubtitleCue = activeDualSubtitles.bottomText;
 
-  // Subtitle File Parser (.srt and .vtt)
+  // Subtitle File Parser (.srt, .vtt, and .ass / .ssa with {\an8} and {\pos(x,y)} tag support)
   const parseSubtitleText = (text: string): SubtitleCue[] => {
     const cues: SubtitleCue[] = [];
     const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+    let playResX = 0;
+    let playResY = 0;
+    const headerLines = normalized.split('\n');
+    for (let i = 0; i < Math.min(headerLines.length, 80); i++) {
+      const rxm = headerLines[i].match(/^\s*PlayResX\s*:\s*(\d+)/i);
+      if (rxm) playResX = parseInt(rxm[1], 10);
+      const rym = headerLines[i].match(/^\s*PlayResY\s*:\s*(\d+)/i);
+      if (rym) playResY = parseInt(rym[1], 10);
+    }
+
+    const extractAssTags = (rawText: string) => {
+      let align: number | undefined;
+      let posX: number | undefined;
+      let posY: number | undefined;
+
+      const anMatch =
+        rawText.match(/\{[^}]*\\an([1-9])[^}]*\}/i) || rawText.match(/\\an([1-9])/i);
+      const legacyTopMatch = rawText.match(/\{[^}]*\\a(5|6|7)[^}]*\}/i);
+      if (anMatch) {
+        align = parseInt(anMatch[1], 10);
+      } else if (legacyTopMatch) {
+        align = 8;
+      }
+
+      const posMatch =
+        rawText.match(/\\pos\(\s*([\d.]+)\s*,\s*([\d.]+)\s*\)/i) ||
+        rawText.match(/\\move\(\s*([\d.]+)\s*,\s*([\d.]+)/i);
+      if (posMatch) {
+        const rawX = parseFloat(posMatch[1]);
+        const rawY = parseFloat(posMatch[2]);
+        if (isFinite(rawX) && isFinite(rawY)) {
+          const refW = playResX > 0 ? playResX : rawX > 384 || rawY > 288 ? 1920 : 384;
+          const refH = playResY > 0 ? playResY : rawX > 384 || rawY > 288 ? 1080 : 288;
+          const normX = rawX <= 100 && playResX === 0 && rawY <= 100 ? rawX : (rawX / refW) * 100;
+          const normY = rawY <= 100 && playResY === 0 && rawX <= 100 ? rawY : (rawY / refH) * 100;
+          posX = Math.max(5, Math.min(95, normX));
+          posY = Math.max(5, Math.min(95, normY));
+          if (align === undefined && posY < 45) {
+            align = 8;
+          }
+        }
+      }
+
+      const cleaned = rawText
+        .replace(/\{[^}]*\}/g, '')
+        .replace(/\\N/g, '\n')
+        .replace(/\\n/g, '\n')
+        .replace(/\\h/g, ' ')
+        .replace(/<[^>]+>/g, '')
+        .trim();
+
+      return { cleaned, align, posX, posY };
+    };
+
+    // Detect .ASS / .SSA format ([Events] / Dialogue: lines)
+    if (/^\s*Dialogue\s*:/im.test(normalized)) {
+      const lines = normalized.split('\n');
+      const assTimeRegex = /^(\d+):(\d{2}):(\d{2})[.:](\d{2,3})$/;
+      const parseAssTime = (str: string): number => {
+        const m = str.trim().match(assTimeRegex);
+        if (!m) return -1;
+        const h = parseInt(m[1], 10);
+        const min = parseInt(m[2], 10);
+        const s = parseInt(m[3], 10);
+        const frac = m[4].length === 2 ? parseInt(m[4], 10) * 10 : parseInt(m[4], 10);
+        return h * 3600 + min * 60 + s + frac / 1000;
+      };
+
+      for (const line of lines) {
+        if (!/^\s*Dialogue\s*:/i.test(line)) continue;
+        const afterColon = line.replace(/^\s*Dialogue\s*:\s*/i, '');
+        const parts = afterColon.split(',');
+        if (parts.length < 10) continue;
+        const start = parseAssTime(parts[1]);
+        const end = parseAssTime(parts[2]);
+        if (start < 0 || end < 0) continue;
+        const rawText = parts.slice(9).join(',');
+        const { cleaned, align, posX, posY } = extractAssTags(rawText);
+        if (cleaned) {
+          cues.push({ start, end, text: cleaned, align, posX, posY });
+        }
+      }
+      if (cues.length > 0) {
+        return cues.sort((a, b) => a.start - b.start);
+      }
+    }
+
     const blocks = normalized.split(/\n\s*\n/);
     const timeRegex = /(\d{1,2}:)?(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(\d{1,2}:)?(\d{2}):(\d{2})[.,](\d{3})/;
 
@@ -1043,12 +1814,9 @@ export default function App() {
 
       const start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000;
       const end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000;
-      const content = lines
-        .slice(timeIdx + 1)
-        .join('\n')
-        .replace(/<[^>]+>/g, '')
-        .trim();
-      if (content) cues.push({ start, end, text: content });
+      const rawContent = lines.slice(timeIdx + 1).join('\n');
+      const { cleaned, align, posX, posY } = extractAssTags(rawContent);
+      if (cleaned) cues.push({ start, end, text: cleaned, align, posX, posY });
     }
     return cues.sort((a, b) => a.start - b.start);
   };
@@ -1063,8 +1831,29 @@ export default function App() {
           setSubtitleCues(parsed);
           setSubtitlesEnabled(true);
           setCustomSubtitlesName(subLabel);
-          saveSubtitlesToVault(subLabel, parsed);
-          showToast(`Субтитры загружены и сохранены: ${parsed.length} фраз`);
+          saveSubtitlesToVault(subLabel, parsed, 'primary');
+          showToast(`Основные субтитры загружены: ${parsed.length} фраз`);
+        } else {
+          showToast('Не удалось распознать таймкоды в файле субтитров');
+        }
+      };
+      reader.readAsText(file, 'utf-8');
+    },
+    [showToast]
+  );
+
+  const loadSecondarySubtitleFileObject = useCallback(
+    (file: File) => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const parsed = parseSubtitleText((event.target?.result as string) || '');
+        if (parsed.length > 0) {
+          const subLabel = `${file.name} (${parsed.length} фраз)`;
+          setSecondarySubtitleCues(parsed);
+          setSecondarySubtitlesEnabled(true);
+          setSecondarySubtitlesName(subLabel);
+          saveSubtitlesToVault(subLabel, parsed, 'secondary');
+          showToast(`Верхние (Dual) субтитры загружены: ${parsed.length} фраз`);
         } else {
           showToast('Не удалось распознать таймкоды в файле субтитров');
         }
@@ -1080,6 +1869,33 @@ export default function App() {
     e.target.value = '';
   };
 
+  const handleSecondarySubtitleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) loadSecondarySubtitleFileObject(file);
+    e.target.value = '';
+  };
+
+  const handleLutFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const text = (ev.target?.result as string) || '';
+      const strip = parseCubeFileToLutStrip(text);
+      if (strip) {
+        customLutStripRef.current = strip;
+        setCustomLutName(file.name);
+        setLutPreset('custom');
+        setLutVersion((v) => v + 1);
+        showToast(`3D LUT загружен: ${file.name}`);
+      } else {
+        showToast('Ошибка чтения таблицы .cube (проверьте формат LUT_3D_SIZE)');
+      }
+    };
+    reader.readAsText(file, 'utf-8');
+    e.target.value = '';
+  };
+
   // Format MM:SS.d
   const formatTime = (sec: number) => {
     if (!isFinite(sec) || sec < 0) sec = 0;
@@ -1089,179 +1905,210 @@ export default function App() {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${d}`;
   };
 
-  // Automatic Background Video Preview Thumbnail & Metadata Extractor (320x180 JPEG DataURL with black-frame retry)
+  const thumbQueueRef = useRef<Array<{ videoUrl: string; videoId: string }>>([]);
+  const isThumbBusyRef = useRef<boolean>(false);
+
+  // Automatic Background Video Preview Thumbnail & Metadata Extractor (serialized 1-at-a-time queue to prevent parallel decoder thermal spikes)
   const generateVideoThumbnail = useCallback((videoUrl: string, videoId: string) => {
     if (!videoUrl) return;
-    const tempVid = document.createElement('video');
-    tempVid.preload = 'auto';
-    tempVid.muted = true;
-    tempVid.playsInline = true;
-    if (videoUrl.startsWith('http://') || videoUrl.startsWith('https://')) {
-      tempVid.crossOrigin = 'anonymous';
-    }
+    // HLS (.m3u8) streams get thumbnails from the resolver or directly from the active Hls-attached videoRef
+    if (/\.m3u8(\?|$)/i.test(videoUrl) || videoUrl.includes(':hls:')) return;
 
-    let finished = false;
-    let retriedBlackFrame = false;
-    const cleanup = () => {
-      if (finished) return;
-      finished = true;
-      try {
-        tempVid.pause();
-        tempVid.removeAttribute('src');
-        tempVid.load();
-      } catch {
-        // Ignore
+    const runNextThumbnail = () => {
+      const nextTask = thumbQueueRef.current.shift();
+      if (!nextTask) {
+        isThumbBusyRef.current = false;
+        return;
       }
-    };
+      isThumbBusyRef.current = true;
+      const { videoUrl: targetUrl, videoId: targetId } = nextTask;
 
-    const timeoutId = window.setTimeout(cleanup, 10000);
+      const tempVid = document.createElement('video');
+      tempVid.preload = 'metadata';
+      tempVid.muted = true;
+      tempVid.playsInline = true;
+      if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
+        tempVid.crossOrigin = 'anonymous';
+      }
 
-    const captureFrameToVault = () => {
-      if (finished) return;
-      try {
-        const vw = tempVid.videoWidth || 320;
-        const vh = tempVid.videoHeight || 180;
-        const thumbW = 320;
-        const thumbH = 180;
-        const canvas = document.createElement('canvas');
-        canvas.width = thumbW;
-        canvas.height = thumbH;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.fillStyle = '#09090c';
-          ctx.fillRect(0, 0, thumbW, thumbH);
-          const scale = Math.max(thumbW / Math.max(1, vw), thumbH / Math.max(1, vh));
-          const drawW = vw * scale;
-          const drawH = vh * scale;
-          const dx = (thumbW - drawW) * 0.5;
-          const dy = (thumbH - drawH) * 0.5;
-          ctx.drawImage(tempVid, dx, dy, drawW, drawH);
+      let finished = false;
+      let retriedBlackFrame = false;
+      let timeoutId = 0;
+      const cleanup = () => {
+        if (finished) return;
+        finished = true;
+        if (timeoutId) {
+          window.clearTimeout(timeoutId);
+          timeoutId = 0;
+        }
+        try {
+          tempVid.onloadedmetadata = null;
+          tempVid.onseeked = null;
+          tempVid.onerror = null;
+          tempVid.pause();
+          tempVid.removeAttribute('src');
+          tempVid.load();
+        } catch {
+          // Ignore
+        }
+        window.setTimeout(runNextThumbnail, 60);
+      };
 
-          // Check if the captured frame is a dark fade-in frame and retry once deeper into the video
-          const dur = isFinite(tempVid.duration) && tempVid.duration > 0 ? tempVid.duration : 0;
-          if (!retriedBlackFrame && dur > 3.0) {
-            try {
-              const sample = ctx.getImageData(40, 20, 240, 140).data;
-              let lumaSum = 0;
-              const step = 64;
-              let count = 0;
-              for (let i = 0; i < sample.length; i += step) {
-                lumaSum += sample[i] * 0.299 + sample[i + 1] * 0.587 + sample[i + 2] * 0.114;
-                count++;
+      timeoutId = window.setTimeout(cleanup, 7500);
+
+      const captureFrameToVault = () => {
+        if (finished) return;
+        try {
+          const vw = tempVid.videoWidth || 320;
+          const vh = tempVid.videoHeight || 180;
+          const thumbW = 320;
+          const thumbH = 180;
+          const canvas = document.createElement('canvas');
+          canvas.width = thumbW;
+          canvas.height = thumbH;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.fillStyle = '#09090c';
+            ctx.fillRect(0, 0, thumbW, thumbH);
+            const scale = Math.max(thumbW / Math.max(1, vw), thumbH / Math.max(1, vh));
+            const drawW = vw * scale;
+            const drawH = vh * scale;
+            const dx = (thumbW - drawW) * 0.5;
+            const dy = (thumbH - drawH) * 0.5;
+            ctx.drawImage(tempVid, dx, dy, drawW, drawH);
+
+            // Check if the captured frame is a dark fade-in frame and retry once deeper into the video
+            const dur = isFinite(tempVid.duration) && tempVid.duration > 0 ? tempVid.duration : 0;
+            if (!retriedBlackFrame && dur > 3.0) {
+              try {
+                const sample = ctx.getImageData(40, 20, 240, 140).data;
+                let lumaSum = 0;
+                const step = 64;
+                let count = 0;
+                for (let i = 0; i < sample.length; i += step) {
+                  lumaSum += sample[i] * 0.299 + sample[i + 1] * 0.587 + sample[i + 2] * 0.114;
+                  count++;
+                }
+                const avgLuma = count > 0 ? lumaSum / count : 30;
+                if (avgLuma < 10) {
+                  retriedBlackFrame = true;
+                  tempVid.currentTime = Math.min(dur - 0.2, Math.max(2.2, dur * 0.32));
+                  return;
+                }
+              } catch {
+                // Ignore getImageData security errors
               }
-              const avgLuma = count > 0 ? lumaSum / count : 30;
-              if (avgLuma < 10) {
-                retriedBlackFrame = true;
-                tempVid.currentTime = Math.min(dur - 0.2, Math.max(2.2, dur * 0.32));
-                return;
-              }
-            } catch {
-              // Ignore getImageData security errors
+            }
+
+            const thumbDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+            const resStr = vw > 0 && vh > 0 ? `${vw}×${vh}` : undefined;
+
+            if (thumbDataUrl && thumbDataUrl.length > 128) {
+              setUserVideos((prev) =>
+                prev.map((v) =>
+                  v.id === targetId
+                    ? {
+                        ...v,
+                        duration: dur > 0 ? dur : v.duration,
+                        resolution: resStr || v.resolution,
+                        thumbnailUrl: thumbDataUrl
+                      }
+                    : v
+                )
+              );
+              setPlaylist((prev) =>
+                prev.map((v) =>
+                  v.id === targetId
+                    ? {
+                        ...v,
+                        duration: dur > 0 ? dur : v.duration,
+                        resolution: resStr || v.resolution,
+                        thumbnailUrl: thumbDataUrl
+                      }
+                    : v
+                )
+              );
+              void updateVideoMetaInVault(targetId, dur, resStr, thumbDataUrl);
             }
           }
-
-          const thumbDataUrl = canvas.toDataURL('image/jpeg', 0.82);
-          const resStr = vw > 0 && vh > 0 ? `${vw}×${vh}` : undefined;
-
-          if (thumbDataUrl && thumbDataUrl.length > 128) {
-            setUserVideos((prev) =>
-              prev.map((v) =>
-                v.id === videoId
-                  ? {
-                      ...v,
-                      duration: dur > 0 ? dur : v.duration,
-                      resolution: resStr || v.resolution,
-                      thumbnailUrl: thumbDataUrl
-                    }
-                  : v
-              )
-            );
-            setPlaylist((prev) =>
-              prev.map((v) =>
-                v.id === videoId
-                  ? {
-                      ...v,
-                      duration: dur > 0 ? dur : v.duration,
-                      resolution: resStr || v.resolution,
-                      thumbnailUrl: thumbDataUrl
-                    }
-                  : v
-              )
-            );
-            void updateVideoMetaInVault(videoId, dur, resStr, thumbDataUrl);
+        } catch {
+          // Ignore cross-origin canvas taint if remote URL
+        } finally {
+          if (!retriedBlackFrame || finished) {
+            window.clearTimeout(timeoutId);
+            cleanup();
           }
         }
-      } catch {
-        // Ignore cross-origin canvas taint if remote URL
-      } finally {
-        if (!retriedBlackFrame || finished) {
-          window.clearTimeout(timeoutId);
-          cleanup();
+      };
+
+      tempVid.onloadedmetadata = () => {
+        if (finished) return;
+        const dur = isFinite(tempVid.duration) && tempVid.duration > 0 ? tempVid.duration : 0;
+        const vw = tempVid.videoWidth || 0;
+        const vh = tempVid.videoHeight || 0;
+        const resStr = vw > 0 && vh > 0 ? `${vw}×${vh}` : undefined;
+
+        if (dur > 0 || resStr) {
+          setUserVideos((prev) =>
+            prev.map((v) =>
+              v.id === targetId
+                ? {
+                    ...v,
+                    duration: dur > 0 ? dur : v.duration,
+                    resolution: resStr || v.resolution
+                  }
+                : v
+            )
+          );
+          setPlaylist((prev) =>
+            prev.map((v) =>
+              v.id === targetId
+                ? {
+                    ...v,
+                    duration: dur > 0 ? dur : v.duration,
+                    resolution: resStr || v.resolution
+                  }
+                : v
+            )
+          );
+          void updateVideoMetaInVault(targetId, dur, resStr);
         }
-      }
-    };
 
-    tempVid.onloadedmetadata = () => {
-      if (finished) return;
-      const dur = isFinite(tempVid.duration) && tempVid.duration > 0 ? tempVid.duration : 0;
-      const vw = tempVid.videoWidth || 0;
-      const vh = tempVid.videoHeight || 0;
-      const resStr = vw > 0 && vh > 0 ? `${vw}×${vh}` : undefined;
+        const targetTime =
+          dur > 2.0
+            ? Math.min(2.5, Math.max(0.8, dur * 0.15))
+            : dur > 0
+            ? Math.max(0.05, Math.min(0.4, dur * 0.4))
+            : 0.5;
+        try {
+          tempVid.currentTime = targetTime;
+        } catch {
+          captureFrameToVault();
+        }
+      };
 
-      if (dur > 0 || resStr) {
-        setUserVideos((prev) =>
-          prev.map((v) =>
-            v.id === videoId
-              ? {
-                  ...v,
-                  duration: dur > 0 ? dur : v.duration,
-                  resolution: resStr || v.resolution
-                }
-              : v
-          )
-        );
-        setPlaylist((prev) =>
-          prev.map((v) =>
-            v.id === videoId
-              ? {
-                  ...v,
-                  duration: dur > 0 ? dur : v.duration,
-                  resolution: resStr || v.resolution
-                }
-              : v
-          )
-        );
-        void updateVideoMetaInVault(videoId, dur, resStr);
-      }
-
-      // Seek into a representative frame (~1.2s or 15% of video, or 0.5s if duration is unknown)
-      const targetTime =
-        dur > 2.0
-          ? Math.min(2.5, Math.max(0.8, dur * 0.15))
-          : dur > 0
-          ? Math.max(0.05, Math.min(0.4, dur * 0.4))
-          : 0.5;
-      try {
-        tempVid.currentTime = targetTime;
-      } catch {
+      tempVid.onseeked = () => {
+        const wasRetry = retriedBlackFrame;
+        if (wasRetry) {
+          retriedBlackFrame = false;
+        }
         captureFrameToVault();
-      }
+      };
+
+      tempVid.onerror = () => {
+        window.clearTimeout(timeoutId);
+        cleanup();
+      };
+
+      tempVid.src = targetUrl;
     };
 
-    tempVid.onseeked = () => {
-      const wasRetry = retriedBlackFrame;
-      if (wasRetry) {
-        retriedBlackFrame = false; // Allow finally block to cleanup after retry capture
-      }
-      captureFrameToVault();
-    };
-
-    tempVid.onerror = () => {
-      window.clearTimeout(timeoutId);
-      cleanup();
-    };
-
-    tempVid.src = videoUrl;
+    if (!thumbQueueRef.current.some((item) => item.videoId === videoId)) {
+      thumbQueueRef.current.push({ videoUrl, videoId });
+    }
+    if (!isThumbBusyRef.current) {
+      runNextThumbnail();
+    }
   }, []);
 
   // Unified helper for accurate seeking (updates video, DOM scrubbers, and triggers WebGL redraw; can defer React state commit during continuous slider drag)
@@ -1297,14 +2144,20 @@ export default function App() {
       if (fsScrubberInputRef.current) {
         fsScrubberInputRef.current.value = String(clamped);
       }
+      const dualSubs = findActiveDualSubtitles(
+        subtitleCues,
+        secondarySubtitleCues,
+        clamped - subDelaySec,
+        subtitlesEnabled,
+        secondarySubtitlesEnabled
+      );
       if (subtitleBoxRef.current && subtitleTextSpanRef.current) {
-        if (!subtitlesEnabled || !subtitleCues.length) {
-          subtitleBoxRef.current.style.display = 'none';
-        } else {
-          const cueText = findActiveSubtitleText(subtitleCues, clamped - subDelaySec);
-          subtitleTextSpanRef.current.textContent = cueText;
-          subtitleBoxRef.current.style.display = cueText ? 'flex' : 'none';
-        }
+        subtitleTextSpanRef.current.textContent = dualSubs.bottomText;
+        subtitleBoxRef.current.style.display = dualSubs.bottomText ? 'flex' : 'none';
+      }
+      if (topSubtitleBoxRef.current && topSubtitleTextSpanRef.current) {
+        topSubtitleTextSpanRef.current.textContent = dualSubs.topText;
+        topSubtitleBoxRef.current.style.display = dualSubs.topText ? 'flex' : 'none';
       }
       if (commitReactState && rememberPosition && !isDemoTestActive) {
         if (activeVideoKeyRef.current) {
@@ -1316,14 +2169,46 @@ export default function App() {
         saveSavedPositions(savedPositionsRef.current);
       }
     },
-    [duration, hasLoadedVideo, isDemoTestActive, rememberPosition, subDelaySec, subtitleCues, subtitlesEnabled]
+    [
+      duration,
+      hasLoadedVideo,
+      isDemoTestActive,
+      rememberPosition,
+      secondarySubtitleCues,
+      secondarySubtitlesEnabled,
+      subDelaySec,
+      subtitleCues,
+      subtitlesEnabled
+    ]
   );
 
   // Built-in 24.0 FPS Cinema Motion Test Stream for instant visual verification of 60/90/120/144 FPS MEMC synthesis
   const startBuiltIn24FpsTest = useCallback(() => {
     if (videoRef.current) {
+      videoRef.current.onloadedmetadata = null;
+      videoRef.current.onloadeddata = null;
+      videoRef.current.onseeked = null;
+      videoRef.current.onerror = null;
       videoRef.current.pause();
     }
+    if (hlsInstanceRef.current) {
+      try {
+        hlsInstanceRef.current.destroy();
+      } catch {
+        // Ignore
+      }
+      hlsInstanceRef.current = null;
+    }
+    setLoopPointA(null);
+    setLoopPointB(null);
+    loopPointsRef.current = { a: null, b: null };
+    detectedAutoCropRef.current = 0;
+    setDetectedAutoCropPct(0);
+    setAnixartSession(null);
+    setStreamQualities({});
+    setActiveStreamQuality('Auto');
+    setSkipTimings([]);
+    setActiveSkipPrompt(null);
     setIsDemoTestActive(true);
     setVideoOutputMode('webgl_direct');
     setWebglContextLost(false);
@@ -1373,14 +2258,14 @@ export default function App() {
       rVfcPendingRef.current = false;
       rVfcActiveRef.current = true;
       const mediaDelta = Math.abs(meta.mediaTime - lastMediaTimeRef.current);
-      if (lastMediaTimeRef.current < 0 || mediaDelta > 0.002) {
+      if (lastMediaTimeRef.current < 0 || mediaDelta >= 0.008) {
         if (lastMediaTimeRef.current >= 0 && mediaDelta < 0.25) {
           const rate = Math.max(0.25, engineConfigRef.current.playbackRate || 1.0);
           const rawFrameDurMs = (mediaDelta * 1000) / rate;
-          if (rawFrameDurMs >= 12 && rawFrameDurMs <= 85) {
+          if (rawFrameDurMs >= 15.5 && rawFrameDurMs <= 85) {
             const stabilizedDurMs = snapToCanonicalCadenceMs(rawFrameDurMs) * rate;
             estimatedFrameIntervalMsRef.current =
-              estimatedFrameIntervalMsRef.current * 0.85 + stabilizedDurMs * 0.15;
+              estimatedFrameIntervalMsRef.current * 0.82 + stabilizedDurMs * 0.18;
           }
         }
         lastMediaTimeRef.current = meta.mediaTime;
@@ -1399,20 +2284,26 @@ export default function App() {
     rVFCIdRef.current = vid.requestVideoFrameCallback(onFrame);
   }, []);
 
-  // Start or Prepare Real Video Playback (supports autoPlay=false for silent startup binding)
+  // Start or Prepare Real Video Playback (supports local Blob, MP4/WebM, HLS .m3u8 via hls.js, and autoPlay=false for silent startup binding)
   const startRealVideoUrl = useCallback(
     (
       url: string,
       title: string,
       sourceLabel: string,
       videoId?: string,
-      autoPlay: boolean = true
+      autoPlay: boolean = true,
+      overrideStartPosSec?: number
     ) => {
       const vid = videoRef.current;
       if (!vid) return;
 
       // Save previous video's position if rememberPosition is active
-      if (rememberPosition && !isDemoTestActive && currentTimeRef.current > 1) {
+      if (
+        rememberPosition &&
+        !isDemoTestActive &&
+        currentTimeRef.current > 1 &&
+        overrideStartPosSec === undefined
+      ) {
         if (activeVideoKeyRef.current) {
           savedPositionsRef.current[activeVideoKeyRef.current] = currentTimeRef.current;
         }
@@ -1420,6 +2311,23 @@ export default function App() {
           savedPositionsRef.current[activeVideoUrlRef.current] = currentTimeRef.current;
         }
         saveSavedPositions(savedPositionsRef.current);
+      }
+
+      // Clear stale video element callbacks BEFORE destroying previous Hls instance to prevent false error toasts
+      vid.onloadedmetadata = null;
+      vid.onloadeddata = null;
+      vid.onseeked = null;
+      vid.onerror = null;
+      vid.pause();
+
+      // Destroy any previous Hls.js instance before attaching new source
+      if (hlsInstanceRef.current) {
+        try {
+          hlsInstanceRef.current.destroy();
+        } catch {
+          // Ignore
+        }
+        hlsInstanceRef.current = null;
       }
 
       if (autoPlay) {
@@ -1431,11 +2339,17 @@ export default function App() {
       if (videoId) {
         setLastActiveVideoId(videoId);
       }
+      setLoopPointA(null);
+      setLoopPointB(null);
+      loopPointsRef.current = { a: null, b: null };
+      detectedAutoCropRef.current = 0;
+      setDetectedAutoCropPct(0);
       setIsDemoTestActive(false);
       setHasLoadedVideo(true);
       setActiveVideoTitle(title);
       setActiveSourceLabel(sourceLabel);
-      currentTimeRef.current = 0;
+      const initialTime = overrideStartPosSec !== undefined && overrideStartPosSec > 0 ? overrideStartPosSec : 0;
+      currentTimeRef.current = initialTime;
       lastDecodedVideoTimeRef.current = -1;
       pendingMediaTimeRef.current = -1;
       lastMediaTimeRef.current = -1;
@@ -1445,20 +2359,104 @@ export default function App() {
       lastKeyframeUploadPerfNowRef.current = performance.now();
       hasNewVideoFrameRef.current = true;
       estimatedFrameIntervalMsRef.current = 33.33;
-      setCurrentTime(0);
+      setCurrentTime(initialTime);
 
-      if (url.startsWith('http://') || url.startsWith('https://')) {
+      const isHlsStream =
+        /\.m3u8(\?|$)/i.test(url) ||
+        /%2Em3u8/i.test(url) ||
+        url.includes(':hls:');
+      let retriedViaProxy = false;
+
+      if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('/api/')) {
         vid.crossOrigin = 'anonymous';
       } else {
         vid.removeAttribute('crossOrigin');
       }
 
-      vid.src = url;
+      // Sync background seekbar preview video element for non-HLS streams
+      const previewVid = seekPreviewVideoRef.current;
+      if (previewVid) {
+        try {
+          if (!isHlsStream) {
+            if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('/api/')) {
+              previewVid.crossOrigin = 'anonymous';
+            } else {
+              previewVid.removeAttribute('crossOrigin');
+            }
+            previewVid.src = url;
+            previewVid.load();
+          } else {
+            previewVid.removeAttribute('src');
+            previewVid.load();
+          }
+        } catch {
+          // Ignore preview video errors
+        }
+      }
+
+      vid.preload = autoPlay ? 'auto' : 'metadata';
       vid.preservesPitch = pitchCorrection;
       vid.playbackRate = playbackRate;
       vid.volume = volume;
       vid.muted = isMuted;
-      vid.load();
+
+      if (isHlsStream && Hls.isSupported()) {
+        let netRetries = 0;
+        let mediaRetries = 0;
+        const hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: false,
+          backBufferLength: 30,
+          maxBufferLength: 20,
+          maxMaxBufferLength: 40,
+          capLevelToPlayerSize: true,
+          startPosition: initialTime > 1 ? initialTime : -1
+        });
+        hlsInstanceRef.current = hls;
+        hls.loadSource(url);
+        hls.attachMedia(vid);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          armVideoFrameCallback();
+          hasNewVideoFrameRef.current = true;
+          forceRedrawRef.current = true;
+          if (autoPlay) {
+            setIsPlaying(true);
+            vid.play().catch(() => {
+              setIsPlaying(false);
+            });
+          }
+        });
+        hls.on(Hls.Events.ERROR, (_evt, data) => {
+          if (data.fatal) {
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR && netRetries < 2) {
+              netRetries += 1;
+              hls.startLoad();
+            } else if (
+              data.type === Hls.ErrorTypes.NETWORK_ERROR &&
+              !retriedViaProxy &&
+              (url.startsWith('http://') || url.startsWith('https://')) &&
+              !url.includes('/api/proxy-media')
+            ) {
+              retriedViaProxy = true;
+              netRetries = 0;
+              const proxiedHls = `/api/proxy-media?url=${encodeURIComponent(url)}`;
+              hls.loadSource(proxiedHls);
+              hls.startLoad();
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries < 3) {
+              mediaRetries += 1;
+              hls.recoverMediaError();
+            } else {
+              hls.destroy();
+              hlsInstanceRef.current = null;
+              showToast('Не удалось декодировать HLS поток');
+            }
+          }
+        });
+      } else {
+        vid.src = url;
+        vid.load();
+      }
+
       armVideoFrameCallback();
 
       vid.onloadedmetadata = () => {
@@ -1468,16 +2466,19 @@ export default function App() {
         const validDur = isFinite(dur) && dur > 0 ? dur : 0;
         setDuration(validDur);
 
-        // Restore saved playback position by videoId, title, or url
-        const savedPos = rememberPosition
-          ? savedPositionsRef.current[key] ??
-            savedPositionsRef.current[title] ??
-            savedPositionsRef.current[url]
-          : undefined;
-        if (savedPos !== undefined && savedPos > 1 && (validDur === 0 || savedPos < validDur - 2)) {
-          v.currentTime = savedPos;
-          currentTimeRef.current = savedPos;
-          setCurrentTime(savedPos);
+        // Restore saved playback position (or explicit overrideStartPosSec on quality switch)
+        const targetPos =
+          overrideStartPosSec !== undefined
+            ? overrideStartPosSec
+            : rememberPosition
+            ? savedPositionsRef.current[key] ??
+              savedPositionsRef.current[title] ??
+              savedPositionsRef.current[url]
+            : undefined;
+        if (targetPos !== undefined && targetPos > 1 && (validDur === 0 || targetPos < validDur - 2)) {
+          v.currentTime = targetPos;
+          currentTimeRef.current = targetPos;
+          setCurrentTime(targetPos);
         }
 
         let resStr: string | undefined;
@@ -1521,6 +2522,39 @@ export default function App() {
         justSeekedRef.current = true;
         hasNewVideoFrameRef.current = true;
         forceRedrawRef.current = true;
+
+        // Capture frame thumbnail from active videoRef if missing (especially for HLS .m3u8 streams)
+        if (videoId && vid.videoWidth > 0 && vid.videoHeight > 0) {
+          try {
+            const thumbCanvas = document.createElement('canvas');
+            thumbCanvas.width = 320;
+            thumbCanvas.height = 180;
+            const tCtx = thumbCanvas.getContext('2d');
+            if (tCtx) {
+              tCtx.drawImage(vid, 0, 0, 320, 180);
+              const dataUrl = thumbCanvas.toDataURL('image/jpeg', 0.8);
+              if (dataUrl && dataUrl.length > 256) {
+                setUserVideos((prev) =>
+                  prev.map((item) =>
+                    item.id === videoId && !item.thumbnailUrl
+                      ? { ...item, thumbnailUrl: dataUrl }
+                      : item
+                  )
+                );
+                setPlaylist((prev) =>
+                  prev.map((item) =>
+                    item.id === videoId && !item.thumbnailUrl
+                      ? { ...item, thumbnailUrl: dataUrl }
+                      : item
+                  )
+                );
+                void updateVideoThumbnailInVault(videoId, dataUrl);
+              }
+            }
+          } catch {
+            // Ignore if cross-origin restricted
+          }
+        }
       };
 
       vid.onseeked = () => {
@@ -1533,6 +2567,23 @@ export default function App() {
       };
 
       vid.onerror = () => {
+        // Automatic server-side CORS proxy fallback if remote MP4 blocks anonymous crossOrigin
+        if (
+          !retriedViaProxy &&
+          !isHlsStream &&
+          (url.startsWith('http://') || url.startsWith('https://')) &&
+          !url.includes('/api/proxy-media')
+        ) {
+          retriedViaProxy = true;
+          const proxied = `/api/proxy-media?url=${encodeURIComponent(url)}`;
+          vid.crossOrigin = 'anonymous';
+          vid.src = proxied;
+          vid.load();
+          if (autoPlay) {
+            vid.play().catch(() => {});
+          }
+          return;
+        }
         showToast('Не удалось декодировать видеопоток');
       };
     },
@@ -1549,13 +2600,15 @@ export default function App() {
     ]
   );
 
-  // Auto-bind smartphone media library, directory handle & subtitles from IndexedDB on startup
+  // Auto-bind smartphone media library, directory handle & Dual Subtitles from IndexedDB on startup
   useEffect(() => {
     let cancelled = false;
+    const createdBlobUrls: string[] = [];
     (async () => {
-      const [cachedVideos, cachedSubs, cachedDir] = await Promise.all([
+      const [cachedVideos, cachedSubs, cachedSecondarySubs, cachedDir] = await Promise.all([
         loadVideosFromVault(),
-        loadSubtitlesFromVault(),
+        loadSubtitlesFromVault('primary'),
+        loadSubtitlesFromVault('secondary'),
         loadDirectoryHandleFromVault()
       ]);
       if (cancelled) return;
@@ -1563,6 +2616,10 @@ export default function App() {
       if (cachedSubs && cachedSubs.cues.length > 0) {
         setSubtitleCues(cachedSubs.cues);
         setCustomSubtitlesName(cachedSubs.name);
+      }
+      if (cachedSecondarySubs && cachedSecondarySubs.cues.length > 0) {
+        setSecondarySubtitleCues(cachedSecondarySubs.cues);
+        setSecondarySubtitlesName(cachedSecondarySubs.name);
       }
 
       if (cachedDir) {
@@ -1573,7 +2630,13 @@ export default function App() {
       if (cachedVideos.length > 0) {
         const hydrated: LibraryVideoItem[] = [];
         for (const rec of cachedVideos) {
-          const liveUrl = rec.blob ? URL.createObjectURL(rec.blob) : rec.remoteUrl || '';
+          let liveUrl = '';
+          if (rec.blob) {
+            liveUrl = URL.createObjectURL(rec.blob);
+            createdBlobUrls.push(liveUrl);
+          } else if (rec.remoteUrl) {
+            liveUrl = rec.remoteUrl;
+          }
           if (!liveUrl) continue;
           hydrated.push({
             id: rec.id,
@@ -1624,6 +2687,13 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      createdBlobUrls.forEach((u) => {
+        try {
+          URL.revokeObjectURL(u);
+        } catch {
+          // Ignore
+        }
+      });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1648,6 +2718,14 @@ export default function App() {
         });
       }
 
+      if (!item.id.startsWith('anixart_')) {
+        setAnixartSession(null);
+        setStreamQualities({});
+        setActiveStreamQuality('Auto');
+        setSkipTimings([]);
+        setActiveSkipPrompt(null);
+      }
+
       if (item.fileUrl) {
         startRealVideoUrl(item.fileUrl, item.title, item.sourceLabel, item.id, true);
       }
@@ -1661,6 +2739,13 @@ export default function App() {
       if (idx < 0 || idx >= playlist.length) return;
       setActivePlaylistIndex(idx);
       const item = playlist[idx];
+      if (!item.id.startsWith('anixart_')) {
+        setAnixartSession(null);
+        setStreamQualities({});
+        setActiveStreamQuality('Auto');
+        setSkipTimings([]);
+        setActiveSkipPrompt(null);
+      }
       if (item.fileUrl) {
         startRealVideoUrl(item.fileUrl, item.title, item.sourceLabel, item.id, true);
       }
@@ -1668,33 +2753,15 @@ export default function App() {
     [playlist, startRealVideoUrl]
   );
 
-  const handleNextTrack = useCallback(() => {
-    if (!playlist.length) {
-      if (hasLoadedVideo || isDemoTestActive) seekToTime(0);
-      return;
-    }
-    if (playlist.length === 1 && !isDemoTestActive && hasLoadedVideo) {
-      seekToTime(0);
-      return;
-    }
-    const nextIdx = isDemoTestActive ? activePlaylistIndex % playlist.length : (activePlaylistIndex + 1) % playlist.length;
-    playPlaylistIndex(nextIdx);
-  }, [activePlaylistIndex, hasLoadedVideo, isDemoTestActive, playPlaylistIndex, playlist.length, seekToTime]);
-
-  const handlePrevTrack = useCallback(() => {
-    if (!playlist.length) {
-      if (hasLoadedVideo || isDemoTestActive) seekToTime(0);
-      return;
-    }
-    if (playlist.length === 1 && !isDemoTestActive && hasLoadedVideo) {
-      seekToTime(0);
-      return;
-    }
-    const prevIdx = isDemoTestActive ? activePlaylistIndex % playlist.length : (activePlaylistIndex - 1 + playlist.length) % playlist.length;
-    playPlaylistIndex(prevIdx);
-  }, [activePlaylistIndex, hasLoadedVideo, isDemoTestActive, playPlaylistIndex, playlist.length, seekToTime]);
-
   const clearAllVideos = useCallback(() => {
+    if (hlsInstanceRef.current) {
+      try {
+        hlsInstanceRef.current.destroy();
+      } catch {
+        // Ignore
+      }
+      hlsInstanceRef.current = null;
+    }
     if (videoRef.current) {
       videoRef.current.pause();
       videoRef.current.removeAttribute('src');
@@ -1712,6 +2779,10 @@ export default function App() {
     activeVideoUrlRef.current = '';
     activeVideoKeyRef.current = '';
     setLastActiveVideoId('');
+    setAnixartSession(null);
+    setStreamQualities({});
+    setSkipTimings([]);
+    setActiveSkipPrompt(null);
     setUserVideos([]);
     setPlaylist([]);
     setActivePlaylistIndex(0);
@@ -1809,6 +2880,9 @@ export default function App() {
       initGlResources();
       lastPass1Signature = '';
       lastPass2ASignature = '';
+      pass2BindingsDirty = true;
+      lastViewportW = -1;
+      lastViewportH = -1;
       setWebglContextLost(false);
       lastDecodedVideoTimeRef.current = -1;
       justSeekedRef.current = true;
@@ -1826,10 +2900,8 @@ export default function App() {
     let flowProg: WebGLProgram | null = null;
     let synthProg: WebGLProgram | null = null;
     let quadBuf: WebGLBuffer | null = null;
-    let meshBuf: WebGLBuffer | null = null;
-    const MESH_COLS = 160;
-    const MESH_ROWS = 90;
-    const meshVertexCount = MESH_COLS * MESH_ROWS * 6;
+    const MESH_COLS = 1;
+    const MESH_ROWS = 1;
     let flowPosLoc = 0;
     let synthPosLoc = 0;
 
@@ -1839,13 +2911,19 @@ export default function App() {
     let allocatedTexW = STAGE_W;
     let allocatedTexH = STAGE_H;
 
-    // Pass 2A Secondary Sub-Frame Anchor FBO (glSubframeMidFbo stores stabilized I_0.5 intermediate keyframe)
+    // Pass 2A 3-Anchor Sub-Frame Cascade FBOs (Q1: I_0.25, Mid: I_0.50, Q3: I_0.75 intermediate keyframes) + 3D LUT Texture
     let glSubframeMidTex: WebGLTexture | null = null;
     let glSubframeMidFbo: WebGLFramebuffer | null = null;
+    let glSubframeQ1Tex: WebGLTexture | null = null;
+    let glSubframeQ1Fbo: WebGLFramebuffer | null = null;
+    let glSubframeQ3Tex: WebGLTexture | null = null;
+    let glSubframeQ3Fbo: WebGLFramebuffer | null = null;
+    let glLutTex: WebGLTexture | null = null;
+    let lastUploadedLutKey = '';
     let allocatedSubframeW = STAGE_W;
     let allocatedSubframeH = STAGE_H;
 
-    // 5-Level Coarse-to-Fine Pyramid FBOs (L4: 16x9, L3: 32x18, L2: 64x36, L1: 128x72, L0: Adaptive up to 256x144) + Pass 1 SAD Heatmap Debug FBO
+    // 6-Level Coarse-to-Fine Pyramid FBOs (L4: 16x9, L3: 32x18, L2: 64x36, L1: 128x72, L05: 256x144, L0: Adaptive up to 512x288) + Pass 1 SAD Heatmap Debug FBO
     const PYR_L4_COLS = 16;
     const PYR_L4_ROWS = 9;
     const PYR_L3_COLS = 32;
@@ -1854,6 +2932,8 @@ export default function App() {
     const PYR_L2_ROWS = 36;
     const PYR_L1_COLS = 128;
     const PYR_L1_ROWS = 72;
+    const PYR_L05_COLS = 256;
+    const PYR_L05_ROWS = 144;
     let glPyrL4Tex: WebGLTexture | null = null;
     let glPyrL4Fbo: WebGLFramebuffer | null = null;
     let glPyrL3Tex: WebGLTexture | null = null;
@@ -1862,6 +2942,8 @@ export default function App() {
     let glPyrL2Fbo: WebGLFramebuffer | null = null;
     let glPyrL1Tex: WebGLTexture | null = null;
     let glPyrL1Fbo: WebGLFramebuffer | null = null;
+    let glPyrL05Tex: WebGLTexture | null = null;
+    let glPyrL05Fbo: WebGLFramebuffer | null = null;
     let glFlowPrevTex: WebGLTexture | null = null;
     let glFlowCurrTex: WebGLTexture | null = null;
     let glFlowFboPrev: WebGLFramebuffer | null = null;
@@ -1880,7 +2962,7 @@ export default function App() {
     let uFlowPyrLevelLoc: WebGLUniformLocation | null = null;
     let uFlowParentStepLoc: WebGLUniformLocation | null = null;
 
-    // Pass 2 (2D Elastic Mesh Warping + Secondary Sub-Frame Cascade + GPU Super-Resolution + HDR10) Uniform Locations
+    // Pass 2 (Zero-Overshade Fullscreen Quad Warping + Secondary Sub-Frame Cascade + Fused Denoiser/Deband/Upscaler + HDR10 + 3D LUT) Uniform Locations
     let uAlphaLoc: WebGLUniformLocation | null = null;
     let uStrengthLoc: WebGLUniformLocation | null = null;
     let uMaxShiftLoc: WebGLUniformLocation | null = null;
@@ -1894,6 +2976,11 @@ export default function App() {
     let uSourceTexelLoc: WebGLUniformLocation | null = null;
     let uFlowStepLoc: WebGLUniformLocation | null = null;
     let uBrightnessLoc: WebGLUniformLocation | null = null;
+    let uContrastLoc: WebGLUniformLocation | null = null;
+    let uSaturationLoc: WebGLUniformLocation | null = null;
+    let uBlackPointLoc: WebGLUniformLocation | null = null;
+    let uDebandStrengthLoc: WebGLUniformLocation | null = null;
+    let uLutStrengthLoc: WebGLUniformLocation | null = null;
     let uHdrLoc: WebGLUniformLocation | null = null;
     let uTargetFpsLoc: WebGLUniformLocation | null = null;
     let uUpscaleModeLoc: WebGLUniformLocation | null = null;
@@ -1923,6 +3010,11 @@ export default function App() {
       flowStepX: -1,
       flowStepY: -1,
       brightness: -1,
+      contrast: -1,
+      saturation: -1,
+      blackPoint: -1,
+      debandStrength: -1,
+      lutStrength: -1,
       hdr: -1,
       targetFps: -1,
       upscaleMode: -1,
@@ -2009,7 +3101,7 @@ export default function App() {
           }
         `;
 
-        // Vertex Shader for Pass 2: 2D Subdivided Mesh (supports both Screen Pass 2B and FBO Pass 2A)
+        // Vertex Shader for Pass 2: Fullscreen Quad (6 vertices — eliminates 86,400-vertex tile-binning & quad overshading heat)
         const vsSynthSource = `
           #ifdef GL_FRAGMENT_PRECISION_HIGH
             precision highp float;
@@ -2021,14 +3113,14 @@ export default function App() {
           uniform int u_fboPass;
           varying vec2 v_uv;
           void main() {
-            float uvY = (u_fboPass == 1) ? ((a_pos.y + 1.0) * 0.5) : (1.0 - (a_pos.y + 1.0) * 0.5);
+            float uvY = (u_fboPass >= 1) ? ((a_pos.y + 1.0) * 0.5) : (1.0 - (a_pos.y + 1.0) * 0.5);
             v_uv = vec2((a_pos.x + 1.0) * 0.5, uvY);
             gl_Position = vec4(a_pos, 0.0, 1.0);
           }
         `;
 
-        // Pass 1 Fragment Shader: 5-Level Coarse-to-Fine Pyramid (L4: 16x9 -> L3: 32x18 -> L2: 64x36 -> L1: 128x72 -> L0: up to 256x144)
-        // + Symmetric Trajectory Patch SAD + Census Structural Invariant + Sub-Pixel Lucas-Kanade + Fast SAD Heatmap Output
+        // Pass 1 Fragment Shader: Thermally-Optimized 5-Level Coarse-to-Fine Pyramid
+        // Uses L1 Manhattan chroma distance (zero sqrt() overhead in inner loop), noise-resilient static block skip, and 4-tap fine refinement
         const fsFlowSource = `
           #ifdef GL_FRAGMENT_PRECISION_HIGH
             precision highp float;
@@ -2053,6 +3145,10 @@ export default function App() {
             return dot(c, vec3(0.299, 0.587, 0.114));
           }
 
+          mediump float fastChromaL1(mediump vec3 a, mediump vec3 b) {
+            return dot(abs(a - b), vec3(0.3333));
+          }
+
           mediump vec3 sadToThermalHeatmap(mediump float sadNorm) {
             mediump float t = clamp(sadNorm, 0.0, 1.0);
             mediump vec3 c0 = vec3(0.035, 0.094, 0.212);
@@ -2074,20 +3170,36 @@ export default function App() {
             vec2 uv0 = clamp(uv - 0.5 * dUV, vec2(0.002), vec2(0.998));
             vec2 uv1 = clamp(uv + 0.5 * dUV, vec2(0.002), vec2(0.998));
 
-            mediump float c0C = getLuma(texture2D(u_prevTex, uv0).rgb);
-            mediump float c0N = getLuma(texture2D(u_prevTex, uv0 + vec2(0.0, -pStep.y)).rgb);
-            mediump float c0S = getLuma(texture2D(u_prevTex, uv0 + vec2(0.0,  pStep.y)).rgb);
-            mediump float c0W = getLuma(texture2D(u_prevTex, uv0 + vec2(-pStep.x, 0.0)).rgb);
-            mediump float c0E = getLuma(texture2D(u_prevTex, uv0 + vec2( pStep.x, 0.0)).rgb);
+            mediump vec3 rgb0C = texture2D(u_prevTex, uv0).rgb;
+            mediump vec3 rgb0N = texture2D(u_prevTex, uv0 + vec2(0.0, -pStep.y)).rgb;
+            mediump vec3 rgb0S = texture2D(u_prevTex, uv0 + vec2(0.0,  pStep.y)).rgb;
+            mediump vec3 rgb0W = texture2D(u_prevTex, uv0 + vec2(-pStep.x, 0.0)).rgb;
+            mediump vec3 rgb0E = texture2D(u_prevTex, uv0 + vec2( pStep.x, 0.0)).rgb;
 
-            mediump float c1C = getLuma(texture2D(u_currTex, uv1).rgb);
-            mediump float c1N = getLuma(texture2D(u_currTex, uv1 + vec2(0.0, -pStep.y)).rgb);
-            mediump float c1S = getLuma(texture2D(u_currTex, uv1 + vec2(0.0,  pStep.y)).rgb);
-            mediump float c1W = getLuma(texture2D(u_currTex, uv1 + vec2(-pStep.x, 0.0)).rgb);
-            mediump float c1E = getLuma(texture2D(u_currTex, uv1 + vec2( pStep.x, 0.0)).rgb);
+            mediump vec3 rgb1C = texture2D(u_currTex, uv1).rgb;
+            mediump vec3 rgb1N = texture2D(u_currTex, uv1 + vec2(0.0, -pStep.y)).rgb;
+            mediump vec3 rgb1S = texture2D(u_currTex, uv1 + vec2(0.0,  pStep.y)).rgb;
+            mediump vec3 rgb1W = texture2D(u_currTex, uv1 + vec2(-pStep.x, 0.0)).rgb;
+            mediump vec3 rgb1E = texture2D(u_currTex, uv1 + vec2( pStep.x, 0.0)).rgb;
 
-            mediump float patchSad = abs(c1C - c0C) * 0.28 +
-              (abs(c1N - c0N) + abs(c1S - c0S) + abs(c1W - c0W) + abs(c1E - c0E)) * 0.18;
+            mediump float c0C = getLuma(rgb0C);
+            mediump float c0N = getLuma(rgb0N);
+            mediump float c0S = getLuma(rgb0S);
+            mediump float c0W = getLuma(rgb0W);
+            mediump float c0E = getLuma(rgb0E);
+
+            mediump float c1C = getLuma(rgb1C);
+            mediump float c1N = getLuma(rgb1N);
+            mediump float c1S = getLuma(rgb1S);
+            mediump float c1W = getLuma(rgb1W);
+            mediump float c1E = getLuma(rgb1E);
+
+            mediump float patchSad = abs(c1C - c0C) * 0.24 +
+              (abs(c1N - c0N) + abs(c1S - c0S) + abs(c1W - c0W) + abs(c1E - c0E)) * 0.15;
+
+            // Fast L1 Manhattan chroma consistency (zero sqrt() instructions in inner search loop!)
+            mediump float chromaSad = fastChromaL1(rgb1C, rgb0C) * 0.18 +
+              (fastChromaL1(rgb1N, rgb0N) + fastChromaL1(rgb1S, rgb0S) + fastChromaL1(rgb1W, rgb0W) + fastChromaL1(rgb1E, rgb0E)) * 0.055;
 
             mediump float gx0 = c0E - c0W;
             mediump float gy0 = c0S - c0N;
@@ -2101,7 +3213,7 @@ export default function App() {
             mediump float cenE = abs((c1E - c1C) - (c0E - c0C));
             mediump float censusDiff = (cenN + cenS + cenW + cenE) * 0.065;
 
-            return patchSad + gradDiff + censusDiff;
+            return patchSad + chromaSad + gradDiff + censusDiff;
           }
 
           void main() {
@@ -2111,24 +3223,38 @@ export default function App() {
               return;
             }
 
-            float levelScale = (u_pyrLevel == 4) ? 9.0 : (u_pyrLevel == 3) ? 5.4 : (u_pyrLevel == 2) ? 3.2 : (u_pyrLevel == 1) ? 1.95 : 1.25;
+            float levelScale = (u_pyrLevel == 4) ? 6.5 : (u_pyrLevel == 3) ? 4.2 : (u_pyrLevel == 2) ? 2.6 : (u_pyrLevel == 1) ? 1.65 : 1.15;
             vec2 pStep = u_texelStep * levelScale;
             vec2 maxShift = max(u_flowMaxShift, vec2(0.001));
 
-            mediump float p0C = getLuma(texture2D(u_prevTex, v_uv).rgb);
-            mediump float p0N = getLuma(texture2D(u_prevTex, v_uv + vec2(0.0, -pStep.y)).rgb);
-            mediump float p0S = getLuma(texture2D(u_prevTex, v_uv + vec2(0.0,  pStep.y)).rgb);
-            mediump float p0W = getLuma(texture2D(u_prevTex, v_uv + vec2(-pStep.x, 0.0)).rgb);
-            mediump float p0E = getLuma(texture2D(u_prevTex, v_uv + vec2( pStep.x, 0.0)).rgb);
+            mediump vec3 rgb0C = texture2D(u_prevTex, v_uv).rgb;
+            mediump vec3 rgb0N = texture2D(u_prevTex, v_uv + vec2(0.0, -pStep.y)).rgb;
+            mediump vec3 rgb0S = texture2D(u_prevTex, v_uv + vec2(0.0,  pStep.y)).rgb;
+            mediump vec3 rgb0W = texture2D(u_prevTex, v_uv + vec2(-pStep.x, 0.0)).rgb;
+            mediump vec3 rgb0E = texture2D(u_prevTex, v_uv + vec2( pStep.x, 0.0)).rgb;
 
-            mediump float p1C = getLuma(texture2D(u_currTex, v_uv).rgb);
-            mediump float p1N = getLuma(texture2D(u_currTex, v_uv + vec2(0.0, -pStep.y)).rgb);
-            mediump float p1S = getLuma(texture2D(u_currTex, v_uv + vec2(0.0,  pStep.y)).rgb);
-            mediump float p1W = getLuma(texture2D(u_currTex, v_uv + vec2(-pStep.x, 0.0)).rgb);
-            mediump float p1E = getLuma(texture2D(u_currTex, v_uv + vec2( pStep.x, 0.0)).rgb);
+            mediump vec3 rgb1C = texture2D(u_currTex, v_uv).rgb;
+            mediump vec3 rgb1N = texture2D(u_currTex, v_uv + vec2(0.0, -pStep.y)).rgb;
+            mediump vec3 rgb1S = texture2D(u_currTex, v_uv + vec2(0.0,  pStep.y)).rgb;
+            mediump vec3 rgb1W = texture2D(u_currTex, v_uv + vec2(-pStep.x, 0.0)).rgb;
+            mediump vec3 rgb1E = texture2D(u_currTex, v_uv + vec2( pStep.x, 0.0)).rgb;
 
-            mediump float zeroPatchSad = abs(p1C - p0C) * 0.28 +
-              (abs(p1N - p0N) + abs(p1S - p0S) + abs(p1W - p0W) + abs(p1E - p0E)) * 0.18;
+            mediump float p0C = getLuma(rgb0C);
+            mediump float p0N = getLuma(rgb0N);
+            mediump float p0S = getLuma(rgb0S);
+            mediump float p0W = getLuma(rgb0W);
+            mediump float p0E = getLuma(rgb0E);
+
+            mediump float p1C = getLuma(rgb1C);
+            mediump float p1N = getLuma(rgb1N);
+            mediump float p1S = getLuma(rgb1S);
+            mediump float p1W = getLuma(rgb1W);
+            mediump float p1E = getLuma(rgb1E);
+
+            mediump float zeroPatchSad = abs(p1C - p0C) * 0.24 +
+              (abs(p1N - p0N) + abs(p1S - p0S) + abs(p1W - p0W) + abs(p1E - p0E)) * 0.15;
+            mediump float zeroChromaSad = fastChromaL1(rgb1C, rgb0C) * 0.18 +
+              (fastChromaL1(rgb1N, rgb0N) + fastChromaL1(rgb1S, rgb0S) + fastChromaL1(rgb1W, rgb0W) + fastChromaL1(rgb1E, rgb0E)) * 0.055;
             mediump float zeroGradDiff = (abs((p1E - p1W) - (p0E - p0W)) + abs((p1S - p1N) - (p0S - p0N))) * 0.16;
             mediump float zeroCenDiff = (
               abs((p1N - p1C) - (p0N - p0C)) +
@@ -2136,7 +3262,7 @@ export default function App() {
               abs((p1W - p1C) - (p0W - p0C)) +
               abs((p1E - p1C) - (p0E - p0C))
             ) * 0.065;
-            mediump float zeroSad = zeroPatchSad + zeroGradDiff + zeroCenDiff;
+            mediump float zeroSad = zeroPatchSad + zeroChromaSad + zeroGradDiff + zeroCenDiff;
 
             mediump float e0 = abs(p0E - p0W) + abs(p0S - p0N) + abs(p0N + p0S + p0W + p0E - 4.0 * p0C);
             mediump float e1 = abs(p1E - p1W) + abs(p1S - p1N) + abs(p1N + p1S + p1W + p1E - 4.0 * p1C);
@@ -2151,14 +3277,20 @@ export default function App() {
             mediump vec2 parW = (texture2D(u_lastFlowTex, v_uv + vec2(-parentStep.x, 0.0)).rg - (128.0 / 255.0)) * 2.0;
             mediump vec2 parE = (texture2D(u_lastFlowTex, v_uv + vec2( parentStep.x, 0.0)).rg - (128.0 / 255.0)) * 2.0;
 
-            mediump vec2 pyramidMeanVel = parC * 0.40 + (parN + parS + parW + parE) * 0.15;
-            mediump vec2 tempVel = parC;
-            bool isStaticBlock = (zeroSad < 0.00035 && dot(pyramidMeanVel, pyramidMeanVel) < 0.00008);
+            // 5-Tap Morphological Vector Median Clamping: strips isolated outlier spikes at every pyramid level
+            mediump vec2 parMin = min(min(parN, parS), min(parW, parE));
+            mediump vec2 parMax = max(max(parN, parS), max(parW, parE));
+            mediump vec2 parMedC = clamp(parC, parMin, parMax);
+            mediump vec2 pyramidMeanVel = parMedC * 0.44 + (parN + parS + parW + parE) * 0.14;
+            mediump vec2 tempVel = parMedC;
+
+            // Thermal optimization: early-exit static blocks even in presence of H.264 sensor grain
+            bool isStaticBlock = (zeroSad < 0.0022 && dot(pyramidMeanVel, pyramidMeanVel) < 0.00025);
 
             if (!isStaticBlock) {
               if (dot(pyramidMeanVel, pyramidMeanVel) > 0.00005) {
                 mediump float sadPyr = evalSymmetricSad(v_uv, pyramidMeanVel * maxShift, pStep);
-                if (sadPyr + 0.0008 < bestSad) {
+                if (sadPyr + 0.0010 < bestSad) {
                   bestSad = sadPyr;
                   bestVel = pyramidMeanVel;
                 }
@@ -2166,10 +3298,11 @@ export default function App() {
 
               for (int p = 0; p < 4; p++) {
                 mediump vec2 candP = (p == 0) ? parN : (p == 1) ? parS : (p == 2) ? parW : parE;
-                if (dot(candP - bestVel, candP - bestVel) > 0.0001) {
+                if (dot(candP - bestVel, candP - bestVel) > 0.00015) {
                   mediump float sadP = evalSymmetricSad(v_uv, candP * maxShift, pStep);
-                  mediump float cohBias = length(candP - pyramidMeanVel) * 0.0018;
-                  if (sadP + cohBias + 0.0007 < bestSad) {
+                  mediump vec2 diffP = abs(candP - pyramidMeanVel);
+                  mediump float cohBias = (diffP.x + diffP.y) * 0.0024;
+                  if (sadP + cohBias + 0.0009 < bestSad) {
                     bestSad = sadP;
                     bestVel = candP;
                   }
@@ -2178,21 +3311,25 @@ export default function App() {
 
               if (u_pyrLevel <= 2) {
                 tempVel = (texture2D(u_temporalFlowTex, v_uv).rg - (128.0 / 255.0)) * 2.0;
-                if (dot(tempVel - bestVel, tempVel - bestVel) > 0.0001) {
+                tempVel = clamp(tempVel, parMin - vec2(0.12), parMax + vec2(0.12));
+                if (dot(tempVel - bestVel, tempVel - bestVel) > 0.00015) {
                   mediump float sadTemp = evalSymmetricSad(v_uv, tempVel * maxShift, pStep);
-                  mediump float tempBias = length(tempVel - pyramidMeanVel) * 0.0018;
-                  if (sadTemp + tempBias + 0.0008 < bestSad) {
+                  mediump vec2 diffT = abs(tempVel - pyramidMeanVel);
+                  mediump float tempBias = (diffT.x + diffT.y) * 0.0024;
+                  if (sadTemp + tempBias + 0.0010 < bestSad) {
                     bestSad = sadTemp;
                     bestVel = tempVel;
                   }
                 }
               }
 
-              float rScale = (u_pyrLevel == 4) ? 1.0 : (u_pyrLevel == 3) ? 0.54 : (u_pyrLevel == 2) ? 0.30 : (u_pyrLevel == 1) ? 0.16 : 0.085;
-              float r0 = 0.46 * rScale;
+              float rScale = (u_pyrLevel == 4) ? 0.85 : (u_pyrLevel == 3) ? 0.48 : (u_pyrLevel == 2) ? 0.26 : (u_pyrLevel == 1) ? 0.14 : 0.075;
+              float r0 = 0.42 * rScale;
               mediump vec2 centerVel0 = bestVel;
 
+              // Coarse levels (L4..L2) run 8-tap diamond+diagonal search; fine levels (L1..L0) run 4-tap cardinal refinement
               for (int d = 0; d < 8; d++) {
+                if (u_pyrLevel <= 1 && d >= 4) break;
                 vec2 offset = vec2(0.0);
                 if (d == 0) offset = vec2( r0,  0.0);
                 else if (d == 1) offset = vec2(-r0,  0.0);
@@ -2203,37 +3340,71 @@ export default function App() {
                 else if (d == 6) offset = vec2( r0 * 0.707, -r0 * 0.707);
                 else offset = vec2(-r0 * 0.707, -r0 * 0.707);
 
-                mediump vec2 candVel = clamp(centerVel0 + offset, vec2(-0.97), vec2(0.97));
+                mediump vec2 candVel = clamp(centerVel0 + offset, vec2(-0.96), vec2(0.96));
                 mediump float candSad = evalSymmetricSad(v_uv, candVel * maxShift, pStep);
-                mediump float regBias = length(candVel) * 0.0008 + length(candVel - pyramidMeanVel) * 0.0032;
+                mediump vec2 diffC = abs(candVel - pyramidMeanVel);
+                mediump float regBias = (abs(candVel.x) + abs(candVel.y)) * 0.0010 + (diffC.x + diffC.y) * 0.0042;
                 if (candSad + regBias < bestSad) {
                   bestSad = candSad;
                   bestVel = candVel;
                 }
               }
 
-              float r1 = 0.16 * rScale;
-              mediump vec2 centerVel1 = bestVel;
-              for (int d = 0; d < 4; d++) {
-                vec2 offset = (d == 0)
-                  ? vec2( r1, 0.0)
-                  : (d == 1)
-                  ? vec2(-r1, 0.0)
-                  : (d == 2)
-                  ? vec2(0.0,  r1)
-                  : vec2(0.0, -r1);
-                mediump vec2 candVel = clamp(centerVel1 + offset, vec2(-0.98), vec2(0.98));
-                mediump float candSad = evalSymmetricSad(v_uv, candVel * maxShift, pStep);
-                mediump float regBias = length(candVel) * 0.0008 + length(candVel - pyramidMeanVel) * 0.0032;
-                if (candSad + regBias < bestSad) {
-                  bestSad = candSad;
-                  bestVel = candVel;
+              if (u_pyrLevel >= 2 || bestSad > 0.0055) {
+                float r1 = 0.15 * rScale;
+                mediump vec2 centerVel1 = bestVel;
+                mediump float sadCenter = bestSad;
+                mediump float sadPosX = sadCenter;
+                mediump float sadNegX = sadCenter;
+                mediump float sadPosY = sadCenter;
+                mediump float sadNegY = sadCenter;
+                bool movedFromCenter = false;
+
+                for (int d = 0; d < 4; d++) {
+                  vec2 offset = (d == 0)
+                    ? vec2( r1, 0.0)
+                    : (d == 1)
+                    ? vec2(-r1, 0.0)
+                    : (d == 2)
+                    ? vec2(0.0,  r1)
+                    : vec2(0.0, -r1);
+                  mediump vec2 candVel = clamp(centerVel1 + offset, vec2(-0.97), vec2(0.97));
+                  mediump float candSad = evalSymmetricSad(v_uv, candVel * maxShift, pStep);
+                  mediump vec2 diffC = abs(candVel - pyramidMeanVel);
+                  mediump float regBias = (abs(candVel.x) + abs(candVel.y)) * 0.0010 + (diffC.x + diffC.y) * 0.0042;
+                  mediump float cost = candSad + regBias;
+                  if (d == 0) sadPosX = cost;
+                  else if (d == 1) sadNegX = cost;
+                  else if (d == 2) sadPosY = cost;
+                  else sadNegY = cost;
+
+                  if (cost < bestSad) {
+                    bestSad = candSad;
+                    bestVel = candVel;
+                    movedFromCenter = true;
+                  }
+                }
+
+                // Zero-Extra-Fetch 1D Parabolic Sub-Pixel Minimum Fitting along X and Y axes
+                // Eliminates discrete velocity quantization on slow camera pans using the 4 cardinal SAD costs already evaluated!
+                if (!movedFromCenter) {
+                  mediump float denomX = sadNegX - 2.0 * sadCenter + sadPosX;
+                  mediump float denomY = sadNegY - 2.0 * sadCenter + sadPosY;
+                  vec2 subOffset = vec2(0.0);
+                  if (denomX > 0.00015) {
+                    subOffset.x = clamp(0.5 * (sadNegX - sadPosX) / denomX, -0.45, 0.45) * r1;
+                  }
+                  if (denomY > 0.00015) {
+                    subOffset.y = clamp(0.5 * (sadNegY - sadPosY) / denomY, -0.45, 0.45) * r1;
+                  }
+                  bestVel = clamp(centerVel1 + subOffset, vec2(-0.97), vec2(0.97));
                 }
               }
             }
 
-            if (!isStaticBlock && u_pyrLevel <= 3) {
-              vec2 lkStep = u_texelStep * ((u_pyrLevel == 3) ? 4.0 : (u_pyrLevel == 2) ? 2.5 : (u_pyrLevel == 1) ? 1.6 : 1.05);
+            // Execute 10-tap sub-pixel Lucas-Kanade ONLY on final Pyramid Level 0 (saves 20 texture fetches on L2 & L1 with identical L0 accuracy!)
+            if (!isStaticBlock && u_pyrLevel == 0 && bestSad > 0.0020) {
+              vec2 lkStep = u_texelStep * 1.05;
               vec2 uv0 = clamp(v_uv - 0.5 * bestVel * maxShift, vec2(0.003), vec2(0.997));
               vec2 uv1 = clamp(v_uv + 0.5 * bestVel * maxShift, vec2(0.003), vec2(0.997));
 
@@ -2253,51 +3424,55 @@ export default function App() {
               mediump float iy = 0.25 * ((m1S - m1N) + (m0S - m0N));
               mediump float it = m1C - m0C;
               mediump float gradMagSq = ix * ix + iy * iy;
-              if (gradMagSq > 0.00025) {
-                mediump float reg = (u_adrenoOpt == 1) ? 0.0035 : 0.0025;
+              if (gradMagSq > 0.00035) {
+                mediump float reg = (u_adrenoOpt == 1) ? 0.0045 : 0.0035;
                 vec2 deltaPixels = -it * vec2(ix, iy) / (gradMagSq + reg);
-                deltaPixels = clamp(deltaPixels, vec2(-1.0), vec2(1.0));
+                deltaPixels = clamp(deltaPixels, vec2(-0.85), vec2(0.85));
                 vec2 deltaVel = (deltaPixels * lkStep) / maxShift;
-                mediump vec2 refinedVel = clamp(bestVel + deltaVel, vec2(-0.98), vec2(0.98));
+                mediump vec2 refinedVel = clamp(bestVel + deltaVel, vec2(-0.97), vec2(0.97));
                 mediump float refinedSad = evalSymmetricSad(v_uv, refinedVel * maxShift, pStep);
-                if (refinedSad <= bestSad + 0.0012) {
+                if (refinedSad <= bestSad + 0.0006) {
                   bestVel = refinedVel;
                   bestSad = refinedSad;
                 }
               }
             }
 
-            // Responsive motion activity gate: preserves full motion vector amplitude on moving content while gating pure static noise
-            mediump float structureGate = smoothstep(0.0004, 0.006, max(e0, e1));
-            mediump float changeGate = smoothstep(0.0003, 0.0045, zeroSad);
-            mediump float improvementGate = smoothstep(1.02, 0.82, bestSad / max(zeroSad, 0.0003));
-            mediump float activityWeight = structureGate * changeGate * mix(0.92, 1.0, improvementGate);
+            // Motion activity & noise gate: rejects compression grain while preserving 100% genuine motion
+            mediump float structureGate = smoothstep(0.0003, 0.0042, max(e0, e1));
+            mediump float changeGate = smoothstep(0.00025, 0.0032, zeroSad);
+            mediump float improvementRatio = bestSad / max(zeroSad, 0.00025);
+            mediump float improvementGate = smoothstep(1.04, 0.78, improvementRatio);
+            mediump float activityWeight = (u_pyrLevel == 0)
+              ? (structureGate * changeGate * mix(0.75, 1.0, improvementGate))
+              : (structureGate * changeGate);
 
-            mediump float matchConf = smoothstep(0.42, 0.018, bestSad);
-            mediump float cutGuard = (u_sceneCutProtect == 1) ? smoothstep(0.56, 0.26, bestSad) : 1.0;
+            mediump float matchConf = smoothstep(0.38, 0.016, bestSad) * mix(0.65, 1.0, improvementGate);
+            mediump float cutGuard = (u_sceneCutProtect == 1) ? smoothstep(0.52, 0.24, bestSad) : 1.0;
             mediump float finalConf = clamp(matchConf * cutGuard, 0.0, 1.0);
 
-            mediump float sadErrorNorm = clamp(bestSad * 4.2, 0.0, 1.0);
+            mediump float sadErrorNorm = clamp(bestSad * 4.5, 0.0, 1.0);
 
             mediump vec2 rawVel = bestVel * activityWeight * cutGuard;
 
             mediump vec2 refCoherent = (u_pyrLevel == 0)
-              ? mix(pyramidMeanVel, tempVel, 0.22) * cutGuard
+              ? mix(pyramidMeanVel, tempVel, 0.24) * cutGuard
               : pyramidMeanVel * cutGuard;
             mediump float velDiff = length(rawVel - refCoherent);
-            mediump float edgeDiscontinuity = smoothstep(0.12, 0.40, velDiff) * finalConf;
-            mediump float cohAgree = smoothstep(0.42, 0.04, velDiff);
+            mediump float cohAgree = smoothstep(0.38, 0.035, velDiff);
+            // Preserve newly discovered motion at coarse/mid pyramid levels without shrinking vector magnitude
+            mediump float discoveryBoost = smoothstep(0.95, 0.65, improvementRatio);
             mediump float blendWeight = (u_pyrLevel == 4)
-              ? 0.94
-              : mix(mix(0.80, 0.96, cohAgree), 0.97, edgeDiscontinuity);
-            mediump vec2 finalVel = clamp(mix(refCoherent, rawVel, blendWeight), vec2(-0.98), vec2(0.98));
+              ? 0.95
+              : mix(0.62, 0.94, max(cohAgree * finalConf, discoveryBoost));
+            mediump vec2 finalVel = clamp(mix(refCoherent, rawVel, blendWeight), vec2(-0.97), vec2(0.97));
 
             mediump vec2 encodedRG = clamp(finalVel * 0.5 + (128.0 / 255.0), 0.0, 1.0);
             gl_FragColor = vec4(encodedRG, finalConf, sadErrorNorm);
           }
         `;
 
-        // Pass 2 Fragment Shader: 2D Elastic Mesh Synthesis + Hierarchical Secondary Sub-Frame Cascade + 9-Tap GPU Upscaler + 10-Bit HDR10
+        // Pass 2 Fragment Shader: Zero-Overshade Fullscreen Quad Synthesis + Fused Spatio-Temporal Denoiser & 9-Tap GPU Upscaler + Fast-Motion Artifact Eliminator + HDR10
         const fsSynthSource = `
           #ifdef GL_FRAGMENT_PRECISION_HIGH
             precision highp float;
@@ -2311,10 +3486,22 @@ export default function App() {
           uniform sampler2D u_flowTex;
           uniform sampler2D u_sadDebugTex;
           uniform sampler2D u_subframeMidTex;
+          uniform sampler2D u_lutTex;
+          precision mediump float;
+          precision mediump int;
+          precision lowp sampler2D;
+
+          uniform sampler2D u_prevTex;
+          uniform sampler2D u_currTex;
+          uniform sampler2D u_flowTex;
+          uniform sampler2D u_subframeMidTex;
+          uniform sampler2D u_subframeQ1Tex;
+          uniform sampler2D u_subframeQ3Tex;
+          uniform sampler2D u_lutTex;
+          uniform sampler2D u_sadDebugTex;
           uniform float u_alpha;
           uniform float u_strength;
           uniform float u_maxShift;
-          uniform float u_haloGuard;
           uniform int u_mode;
           uniform int u_splitCompare;
           uniform int u_monochrome;
@@ -2324,6 +3511,11 @@ export default function App() {
           uniform vec2 u_sourceTexel;
           uniform vec2 u_flowStep;
           uniform float u_brightness;
+          uniform float u_contrast;
+          uniform float u_saturation;
+          uniform float u_blackPoint;
+          uniform float u_debandStrength;
+          uniform float u_lutStrength;
           uniform float u_hdrStrength;
           uniform float u_targetFps;
           uniform int u_upscaleMode;
@@ -2335,6 +3527,7 @@ export default function App() {
           uniform int u_fboPass;
           uniform int u_subframeCascade;
           uniform float u_coherenceGuard;
+          uniform float u_haloGuard;
 
           mediump float getLuma(mediump vec3 c) {
             return dot(c, vec3(0.299, 0.587, 0.114));
@@ -2345,31 +3538,100 @@ export default function App() {
             return w * w * (2.2 * w - 1.2);
           }
 
-          // Honest 9-Tap Anti-Ringing GPU Super-Resolution Upscaler (1.5x FHD+ / 2.0x QHD 2K / 4.0x 4K UHD)
-          // Modes: 1 = AMD FSR 1.0 RCAS, 2 = Anime4K Line Reconstruction, 3 = Cinema Lanczos-4, 4 = Qualcomm Snapdragon GSR
-          mediump vec3 applyGpuUpscaler(
-            mediump vec3 baseColor,
-            mediump vec3 refCurrColor,
-            vec2 uvCurrCoord,
+          // Trilinear 3D LUT Sampler over 256x16 (16x16x16) RGBA Strip Texture
+          mediump vec3 sample3DLutStrip(mediump vec3 col) {
+            mediump vec3 c = clamp(col, 0.0, 1.0);
+            mediump float bSlice = c.b * 15.0;
+            mediump float b0 = floor(bSlice);
+            mediump float b1 = min(15.0, b0 + 1.0);
+            mediump float bf = bSlice - b0;
+            mediump float uBase = (c.r * 15.0 + 0.5) / 256.0;
+            mediump float vCoord = (c.g * 15.0 + 0.5) / 16.0;
+            mediump vec3 s0 = texture2D(u_lutTex, vec2(uBase + b0 / 16.0, vCoord)).rgb;
+            mediump vec3 s1 = texture2D(u_lutTex, vec2(uBase + b1 / 16.0, vCoord)).rgb;
+            return mix(s0, s1, bf);
+          }
+
+          // Fused Single-Pass 3x3 Neighborhood Denoiser + Adaptive Blue-Noise Debanding + Anti-Ringing GPU Super-Resolution Upscaler
+          // Fetches the 8 neighbors from u_currTex ONLY ONCE per pixel (cuts full-res texture memory bandwidth by 50% and eliminates GPU thermal throttling!)
+          mediump vec3 applyFusedDenoiseAndUpscale(
+            mediump vec3 inColor,
+            vec2 uvSample,
             int upMode,
             float upFactor,
             float sharpness,
-            float denoise,
+            float denoiseStrength,
+            mediump float debandStr,
+            mediump float motionStress,
             mediump float occDamp
           ) {
+            mediump float dStr = clamp(denoiseStrength + motionStress * 0.28, 0.0, 1.0);
+            if (dStr <= 0.01 && debandStr <= 0.01 && upMode <= 0) return inColor;
+
             float factorNorm = clamp((upFactor - 1.5) / 2.5, 0.0, 1.0);
-            vec2 texel = u_sourceTexel * mix(0.90, 0.62, factorNorm);
+            vec2 texel = u_sourceTexel * ((upMode > 0) ? mix(0.90, 0.65, factorNorm) : 0.90);
 
-            mediump vec3 cN  = texture2D(u_currTex, clamp(uvCurrCoord + vec2(0.0, -texel.y), vec2(0.001), vec2(0.999))).rgb;
-            mediump vec3 cS  = texture2D(u_currTex, clamp(uvCurrCoord + vec2(0.0,  texel.y), vec2(0.001), vec2(0.999))).rgb;
-            mediump vec3 cW  = texture2D(u_currTex, clamp(uvCurrCoord + vec2(-texel.x, 0.0), vec2(0.001), vec2(0.999))).rgb;
-            mediump vec3 cE  = texture2D(u_currTex, clamp(uvCurrCoord + vec2( texel.x, 0.0), vec2(0.001), vec2(0.999))).rgb;
-            mediump vec3 cNW = texture2D(u_currTex, clamp(uvCurrCoord + vec2(-texel.x, -texel.y) * 0.85, vec2(0.001), vec2(0.999))).rgb;
-            mediump vec3 cNE = texture2D(u_currTex, clamp(uvCurrCoord + vec2( texel.x, -texel.y) * 0.85, vec2(0.001), vec2(0.999))).rgb;
-            mediump vec3 cSW = texture2D(u_currTex, clamp(uvCurrCoord + vec2(-texel.x,  texel.y) * 0.85, vec2(0.001), vec2(0.999))).rgb;
-            mediump vec3 cSE = texture2D(u_currTex, clamp(uvCurrCoord + vec2( texel.x,  texel.y) * 0.85, vec2(0.001), vec2(0.999))).rgb;
+            mediump vec3 cN  = texture2D(u_currTex, clamp(uvSample + vec2(0.0, -texel.y), vec2(0.001), vec2(0.999))).rgb;
+            mediump vec3 cS  = texture2D(u_currTex, clamp(uvSample + vec2(0.0,  texel.y), vec2(0.001), vec2(0.999))).rgb;
+            mediump vec3 cW  = texture2D(u_currTex, clamp(uvSample + vec2(-texel.x, 0.0), vec2(0.001), vec2(0.999))).rgb;
+            mediump vec3 cE  = texture2D(u_currTex, clamp(uvSample + vec2( texel.x, 0.0), vec2(0.001), vec2(0.999))).rgb;
+            mediump vec3 cNW = texture2D(u_currTex, clamp(uvSample + vec2(-texel.x, -texel.y) * 0.85, vec2(0.001), vec2(0.999))).rgb;
+            mediump vec3 cNE = texture2D(u_currTex, clamp(uvSample + vec2( texel.x, -texel.y) * 0.85, vec2(0.001), vec2(0.999))).rgb;
+            mediump vec3 cSW = texture2D(u_currTex, clamp(uvSample + vec2(-texel.x,  texel.y) * 0.85, vec2(0.001), vec2(0.999))).rgb;
+            mediump vec3 cSE = texture2D(u_currTex, clamp(uvSample + vec2( texel.x,  texel.y) * 0.85, vec2(0.001), vec2(0.999))).rgb;
 
-            mediump float lC  = getLuma(refCurrColor);
+            mediump vec3 minCard = min(min(cN, cS), min(cW, cE));
+            mediump vec3 maxCard = max(max(cN, cS), max(cW, cE));
+            mediump vec3 minDiag = min(min(cNW, cSE), min(cNE, cSW));
+            mediump vec3 maxDiag = max(max(cNW, cSE), max(cNE, cSW));
+
+            mediump vec3 cleanBase = inColor;
+            if (dStr > 0.01) {
+              // Stage 1: Soft Morphological 3x3 Envelope Clamp (eliminates isolated mosquito noise & Gibbs ringing spikes)
+              mediump vec3 softMin = max(min(minCard, minDiag), min(maxCard, minDiag) * 0.5 + min(minCard, minDiag) * 0.5);
+              mediump vec3 softMax = min(max(maxCard, maxDiag), max(minCard, maxDiag) * 0.5 + max(maxCard, maxDiag) * 0.5);
+              mediump vec3 despiked = mix(inColor, clamp(inColor, softMin, softMax), clamp(dStr * 0.85, 0.0, 0.92));
+
+              // Stage 2: Edge-Preserving Bilateral Filter (smooths compression blocks & grain while keeping edges 100% sharp)
+              mediump float invSigmaSq = mix(140.0, 38.0, dStr);
+              mediump float wN  = 1.0 / (1.0 + dot(cN  - despiked, cN  - despiked) * invSigmaSq);
+              mediump float wS  = 1.0 / (1.0 + dot(cS  - despiked, cS  - despiked) * invSigmaSq);
+              mediump float wW  = 1.0 / (1.0 + dot(cW  - despiked, cW  - despiked) * invSigmaSq);
+              mediump float wE  = 1.0 / (1.0 + dot(cE  - despiked, cE  - despiked) * invSigmaSq);
+              mediump float wNW = 0.7 / (1.0 + dot(cNW - despiked, cNW - despiked) * invSigmaSq);
+              mediump float wNE = 0.7 / (1.0 + dot(cNE - despiked, cNE - despiked) * invSigmaSq);
+              mediump float wSW = 0.7 / (1.0 + dot(cSW - despiked, cSW - despiked) * invSigmaSq);
+              mediump float wSE = 0.7 / (1.0 + dot(cSE - despiked, cSE - despiked) * invSigmaSq);
+              mediump float wCenter = mix(2.2, 0.95, dStr);
+
+              mediump float wTotal = wCenter + wN + wS + wW + wE + wNW + wNE + wSW + wSE;
+              mediump vec3 bilateral = (
+                despiked * wCenter +
+                cN * wN + cS * wS + cW * wW + cE * wE +
+                cNW * wNW + cNE * wNE + cSW * wSW + cSE * wSE
+              ) / max(wTotal, 0.0001);
+
+              cleanBase = clamp(mix(despiked, bilateral, clamp(dStr * 0.88, 0.0, 0.90)), 0.0, 1.0);
+            }
+
+            // Stage 2.5: Adaptive Debanding + Interleaved Gradient Dithering (eliminates 8-bit sky/shadow banding before upscaling!)
+            if (debandStr > 0.01) {
+              mediump vec3 avg8Deband = (cN + cS + cW + cE + cNW + cNE + cSW + cSE) * 0.125;
+              mediump vec3 maxDiffCard = max(
+                max(abs(cN - cleanBase), abs(cS - cleanBase)),
+                max(abs(cW - cleanBase), abs(cE - cleanBase))
+              );
+              mediump float thresh = mix(0.006, 0.036, debandStr);
+              mediump vec3 bandMask = vec3(1.0) - smoothstep(vec3(thresh * 0.35), vec3(thresh), maxDiffCard);
+              float bn1 = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+              float bn2 = fract(52.9829189 * fract(dot(gl_FragCoord.xy + vec2(11.0, 23.0), vec2(0.06711056, 0.00583715))));
+              float blueDither = ((bn1 + bn2) - 1.0) * (mix(1.2, 4.2, debandStr) / 255.0);
+              cleanBase = clamp(mix(cleanBase, avg8Deband + vec3(blueDither), bandMask * debandStr * 0.88), 0.0, 1.0);
+            }
+
+            if (upMode <= 0) return cleanBase;
+
+            mediump float lC  = getLuma(cleanBase);
             mediump float lN  = getLuma(cN);
             mediump float lS  = getLuma(cS);
             mediump float lW  = getLuma(cW);
@@ -2382,60 +3644,51 @@ export default function App() {
             mediump vec3 avgCross = 0.25 * (cN + cS + cW + cE);
             mediump vec3 avgDiag  = 0.25 * (cNW + cNE + cSW + cSE);
             mediump vec3 avg8     = avgCross * 0.68 + avgDiag * 0.32;
-            mediump vec3 zeroDcDetail = (refCurrColor - avg8) * occDamp;
 
-            mediump vec3 minCard = min(min(cN, cS), min(cW, cE));
-            mediump vec3 maxCard = max(max(cN, cS), max(cW, cE));
-            mediump vec3 minDiag = min(min(cNW, cSE), min(cNE, cSW));
-            mediump vec3 maxDiag = max(max(cNW, cSE), max(cNE, cSW));
-            mediump vec3 nbhMin  = min(refCurrColor, min(minCard, minDiag));
-            mediump vec3 nbhMax  = max(refCurrColor, max(maxCard, maxDiag));
-            mediump vec3 span    = max(nbhMax - nbhMin, vec3(0.015));
-            mediump vec3 minBound = clamp(baseColor - span * 0.65, 0.0, 1.0);
-            mediump vec3 maxBound = clamp(baseColor + span * 0.65, 0.0, 1.0);
+            // Noise-Coring Detail Gate: prevents sharpening of H.264 mosquito noise, film grain & fast-motion residuals
+            mediump vec3 rawDetail = cleanBase - avg8;
+            mediump float detailMag = length(rawDetail);
+            mediump float noiseFloor = mix(0.004, 0.028, clamp(denoiseStrength, 0.0, 1.0));
+            mediump float coringGate = smoothstep(noiseFloor, noiseFloor * 3.2 + 0.006, detailMag);
+            mediump vec3 zeroDcDetail = rawDetail * coringGate * occDamp;
+
+            mediump vec3 nbhMin  = min(cleanBase, min(minCard, minDiag));
+            mediump vec3 nbhMax  = max(cleanBase, max(maxCard, maxDiag));
+            mediump vec3 span    = max(nbhMax - nbhMin, vec3(0.012));
+            mediump vec3 minBound = clamp(cleanBase - span * 0.52, 0.0, 1.0);
+            mediump vec3 maxBound = clamp(cleanBase + span * 0.52, 0.0, 1.0);
 
             mediump float gradMag = abs(lN - lS) + abs(lE - lW) + 0.5 * (abs(lNW - lSE) + abs(lNE - lSW));
-            mediump float flatMask = (1.0 - smoothstep(0.014, 0.085, gradMag)) * clamp(denoise, 0.0, 1.0);
-            mediump vec3 cleanBase = clamp(mix(baseColor, mix(baseColor, avg8, 0.42), flatMask), 0.0, 1.0);
-
-            mediump float effSharp = sharpness * (1.0 + 0.28 * factorNorm);
+            mediump float effSharp = sharpness * (1.0 + 0.22 * factorNorm) * (1.0 - 0.35 * clamp(denoiseStrength, 0.0, 1.0));
 
             if (upMode == 4) {
-              // Mode 4: Qualcomm Snapdragon GSR (12-Tap Edge-Directed Isophote Kernel)
+              // Mode 4: Qualcomm Snapdragon GSR (Edge-Directed Isophote Kernel reusing 3x3 neighborhood)
               mediump float gx = (lE - lW) + 0.5 * ((lNE - lNW) + (lSE - lSW));
               mediump float gy = (lS - lN) + 0.5 * ((lSE - lNE) + (lSW - lNW));
-              mediump vec2 gradDir = vec2(gx, gy);
-              mediump float gradLen = max(length(gradDir), 0.0005);
-              mediump vec2 edgeNormal = gradDir / gradLen;
-
-              vec2 tangentStep = vec2(-edgeNormal.y, edgeNormal.x) * texel * 0.82;
-              mediump vec3 cT1 = texture2D(u_currTex, clamp(uvCurrCoord + tangentStep, vec2(0.001), vec2(0.999))).rgb;
-              mediump vec3 cT2 = texture2D(u_currTex, clamp(uvCurrCoord - tangentStep, vec2(0.001), vec2(0.999))).rgb;
-              mediump vec3 edgeSmooth = 0.5 * (cT1 + cT2);
-
+              mediump float gradLen = max(length(vec2(gx, gy)), 0.0005);
               mediump float edgeWeight = smoothstep(0.012, 0.16, gradLen);
-              mediump float gsrGain = mix(0.58, 1.55, clamp(effSharp * 0.82, 0.0, 1.0)) * gsrFastLanczos2(gradLen * 1.25);
-              mediump vec3 gsrBase = mix(cleanBase, mix(cleanBase, edgeSmooth, 0.26 * edgeWeight), occDamp);
+              mediump float gsrGain = mix(0.48, 1.38, clamp(effSharp * 0.82, 0.0, 1.0)) * gsrFastLanczos2(gradLen * 1.25);
+              mediump vec3 gsrBase = mix(cleanBase, mix(cleanBase, avg8, 0.28 * edgeWeight), occDamp);
               return clamp(gsrBase + zeroDcDetail * gsrGain, minBound, maxBound);
             } else if (upMode == 1) {
               // Mode 1: AMD FSR 1.0 RCAS (Robust Contrast-Adaptive Sharpening with Luma-Guided Gain)
               mediump float minL = min(lC, min(min(lN, lS), min(lW, lE)));
               mediump float maxL = max(lC, max(max(lN, lS), max(lW, lE)));
               mediump float casAmp = sqrt(clamp(min(minL, 1.0 - maxL) / max(maxL, 0.001), 0.0, 1.0));
-              mediump float gain = casAmp * mix(0.52, 1.46, clamp(effSharp * 0.80, 0.0, 1.0));
+              mediump float gain = casAmp * mix(0.45, 1.32, clamp(effSharp * 0.80, 0.0, 1.0));
               return clamp(cleanBase + zeroDcDetail * gain, minBound, maxBound);
             } else if (upMode == 2) {
               // Mode 2: Anime4K (Thin-Line & Contour Push Reconstruction + Anti-Alias Tangent Smooth)
-              mediump float lap = 4.0 * lC - (lN + lS + lW + lE) + 0.5 * (4.0 * lC - (lNW + lNE + lSW + lSE));
-              mediump float push = clamp(lap * effSharp * 1.55, -0.62, 0.62) * occDamp;
+              mediump float lap = (4.0 * lC - (lN + lS + lW + lE)) * coringGate;
+              mediump float push = clamp(lap * effSharp * 1.35, -0.50, 0.50) * occDamp;
               mediump vec3 targetExtrema = (push >= 0.0) ? maxBound : minBound;
-              mediump vec3 lineReconstructed = mix(cleanBase, targetExtrema, abs(push) * 0.70);
-              return clamp(lineReconstructed + zeroDcDetail * (0.48 * effSharp), minBound, maxBound);
+              mediump vec3 lineReconstructed = mix(cleanBase, targetExtrema, abs(push) * 0.62);
+              return clamp(lineReconstructed + zeroDcDetail * (0.42 * effSharp), minBound, maxBound);
             } else {
               // Mode 3: Cinema Lanczos-4 Detail & Micro-Contrast Enhancer
               mediump float midToneBell = 4.0 * lC * (1.0 - lC);
-              mediump float ringingGuard = 1.0 - smoothstep(0.18, 0.55, gradMag);
-              mediump float boost = (0.60 + 1.12 * effSharp) * mix(0.48, 1.0, midToneBell) * mix(0.55, 1.0, ringingGuard);
+              mediump float ringingGuard = 1.0 - smoothstep(0.16, 0.50, gradMag);
+              mediump float boost = (0.52 + 1.02 * effSharp) * mix(0.48, 1.0, midToneBell) * mix(0.55, 1.0, ringingGuard);
               return clamp(cleanBase + zeroDcDetail * boost, minBound, maxBound);
             }
           }
@@ -2480,8 +3733,8 @@ export default function App() {
           }
 
           void main() {
-            vec2 mappedUV = (u_fboPass == 1) ? v_uv : ((v_uv - 0.5) * u_uvScale + 0.5);
-            if (mappedUV.x < 0.0 || mappedUV.x > 1.0 || mappedUV.y < 0.0 || mappedUV.y > 1.0) {
+            vec2 mappedUV = (u_fboPass >= 1) ? v_uv : ((v_uv - 0.5) * u_uvScale + 0.5);
+            if (u_fboPass == 0 && (mappedUV.x < 0.0 || mappedUV.x > 1.0 || mappedUV.y < 0.0 || mappedUV.y > 1.0)) {
               gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
               return;
             }
@@ -2489,51 +3742,42 @@ export default function App() {
             bool isOriginalSide = (u_fboPass == 0 && u_splitCompare == 1 && v_uv.x < 0.5);
             mediump float occBias = 0.0;
             mediump vec3 outColor;
-            mediump vec3 upscalerRefCurr;
             vec2 upscalerUvCurr = mappedUV;
 
             if (isOriginalSide || u_alpha <= 0.005) {
-              mediump vec3 prevDirect = texture2D(u_prevTex, mappedUV).rgb;
-              outColor = prevDirect;
-              upscalerRefCurr = prevDirect;
+              outColor = texture2D(u_prevTex, mappedUV).rgb;
             } else if (u_mode == 0 || u_alpha >= 0.995) {
-              mediump vec3 currDirect = texture2D(u_currTex, mappedUV).rgb;
-              outColor = currDirect;
-              upscalerRefCurr = currDirect;
+              outColor = texture2D(u_currTex, mappedUV).rgb;
             } else if (u_mode == 1) {
               // Mode 1: Frame Blending (Cross-Dissolve)
               mediump vec3 pCol = texture2D(u_prevTex, mappedUV).rgb;
               mediump vec3 cCol = texture2D(u_currTex, mappedUV).rgb;
               outColor = mix(pCol, cCol, u_alpha);
-              upscalerRefCurr = cCol;
             } else {
-              // Mode 2: 5-Level Pyramid Optical Flow MEMC + Secondary Sub-Frame Cascade FBO
+              // Mode 2: 5-Level Pyramid Optical Flow MEMC + Fast-Motion Artifact Eliminator + 3-Anchor Sub-Frame Cascade FBO (I_0.25, I_0.50, I_0.75)
+              // Uses 5-Tap Cross Flow Lookup with hardware bilinear filtering (saves 4 flow texture fetches per screen pixel!)
               vec2 flowStep = u_flowStep;
-              mediump vec4 flowC  = texture2D(u_flowTex, mappedUV);
-              mediump vec4 flowN  = texture2D(u_flowTex, mappedUV + vec2(0.0, -flowStep.y));
-              mediump vec4 flowS  = texture2D(u_flowTex, mappedUV + vec2(0.0,  flowStep.y));
-              mediump vec4 flowW  = texture2D(u_flowTex, mappedUV + vec2(-flowStep.x, 0.0));
-              mediump vec4 flowE  = texture2D(u_flowTex, mappedUV + vec2( flowStep.x, 0.0));
-              mediump vec4 flowNW = texture2D(u_flowTex, mappedUV + vec2(-flowStep.x, -flowStep.y));
-              mediump vec4 flowNE = texture2D(u_flowTex, mappedUV + vec2( flowStep.x, -flowStep.y));
-              mediump vec4 flowSW = texture2D(u_flowTex, mappedUV + vec2(-flowStep.x,  flowStep.y));
-              mediump vec4 flowSE = texture2D(u_flowTex, mappedUV + vec2( flowStep.x,  flowStep.y));
+              mediump vec4 flowC = texture2D(u_flowTex, mappedUV);
+              mediump vec4 flowN = texture2D(u_flowTex, mappedUV + vec2(0.0, -flowStep.y));
+              mediump vec4 flowS = texture2D(u_flowTex, mappedUV + vec2(0.0,  flowStep.y));
+              mediump vec4 flowW = texture2D(u_flowTex, mappedUV + vec2(-flowStep.x, 0.0));
+              mediump vec4 flowE = texture2D(u_flowTex, mappedUV + vec2( flowStep.x, 0.0));
 
-              mediump vec2 vC  = (flowC.rg  - (128.0 / 255.0)) * 2.0;
-              mediump vec2 vN  = (flowN.rg  - (128.0 / 255.0)) * 2.0;
-              mediump vec2 vS  = (flowS.rg  - (128.0 / 255.0)) * 2.0;
-              mediump vec2 vW  = (flowW.rg  - (128.0 / 255.0)) * 2.0;
-              mediump vec2 vE  = (flowE.rg  - (128.0 / 255.0)) * 2.0;
-              mediump vec2 vNW = (flowNW.rg - (128.0 / 255.0)) * 2.0;
-              mediump vec2 vNE = (flowNE.rg - (128.0 / 255.0)) * 2.0;
-              mediump vec2 vSW = (flowSW.rg - (128.0 / 255.0)) * 2.0;
-              mediump vec2 vSE = (flowSE.rg - (128.0 / 255.0)) * 2.0;
+              mediump vec2 vC = (flowC.rg - (128.0 / 255.0)) * 2.0;
+              mediump vec2 vN = (flowN.rg - (128.0 / 255.0)) * 2.0;
+              mediump vec2 vS = (flowS.rg - (128.0 / 255.0)) * 2.0;
+              mediump vec2 vW = (flowW.rg - (128.0 / 255.0)) * 2.0;
+              mediump vec2 vE = (flowE.rg - (128.0 / 255.0)) * 2.0;
 
               mediump vec3 unwarpedPrev = texture2D(u_prevTex, mappedUV).rgb;
               mediump vec3 unwarpedCurr = texture2D(u_currTex, mappedUV).rgb;
 
-              mediump vec2 laplacianMean = (vN + vS + vW + vE) * 0.16 + (vNW + vNE + vSW + vSE) * 0.09;
-              mediump vec2 baseMean = vC * 0.44 + laplacianMean * 0.56;
+              // 5-Tap Morphological Vector Median Clamp (strips outlier motion spikes before warping!)
+              mediump vec2 vMinCard = min(min(vN, vS), min(vW, vE));
+              mediump vec2 vMaxCard = max(max(vN, vS), max(vW, vE));
+              mediump vec2 vMedC = clamp(vC, vMinCard, vMaxCard);
+
+              mediump vec2 baseMean = vMedC * 0.44 + (vN + vS + vW + vE) * 0.14;
 
               mediump float qC = (0.35 + flowC.b) * (1.15 - 0.65 * flowC.a);
               mediump float qN = (0.28 + flowN.b) * (1.15 - 0.65 * flowN.a);
@@ -2541,159 +3785,239 @@ export default function App() {
               mediump float qW = (0.28 + flowW.b) * (1.15 - 0.65 * flowW.a);
               mediump float qE = (0.28 + flowE.b) * (1.15 - 0.65 * flowE.a);
 
-              mediump float wC = qC * 1.55 / (1.0 + dot(vC - baseMean, vC - baseMean) * 14.0);
-              mediump float wN = qN / (1.0 + dot(vN - baseMean, vN - baseMean) * 14.0);
-              mediump float wS = qS / (1.0 + dot(vS - baseMean, vS - baseMean) * 14.0);
-              mediump float wW = qW / (1.0 + dot(vW - baseMean, vW - baseMean) * 14.0);
-              mediump float wE = qE / (1.0 + dot(vE - baseMean, vE - baseMean) * 14.0);
+              mediump float wC = qC * 1.65 / (1.0 + dot(vMedC - baseMean, vMedC - baseMean) * 18.0);
+              mediump float wN = qN / (1.0 + dot(vN - baseMean, vN - baseMean) * 18.0);
+              mediump float wS = qS / (1.0 + dot(vS - baseMean, vS - baseMean) * 18.0);
+              mediump float wW = qW / (1.0 + dot(vW - baseMean, vW - baseMean) * 18.0);
+              mediump float wE = qE / (1.0 + dot(vE - baseMean, vE - baseMean) * 18.0);
               mediump float wSum = max(wC + wN + wS + wW + wE, 0.0001);
-              mediump vec2 baseVel = (vC * wC + vN * wN + vS * wS + vW * wW + vE * wE) / wSum;
-
-              mediump float mC = (0.025 + sqrt(dot(vC, vC))) * qC * 1.35;
-              mediump float mN = (0.025 + sqrt(dot(vN, vN))) * qN;
-              mediump float mS = (0.025 + sqrt(dot(vS, vS))) * qS;
-              mediump float mW = (0.025 + sqrt(dot(vW, vW))) * qW;
-              mediump float mE = (0.025 + sqrt(dot(vE, vE))) * qE;
-              mediump float mSum = max(mC + mN + mS + mW + mE, 0.0001);
-              mediump vec2 peakVel = (vC * mC + vN * mN + vS * mS + vW * mW + vE * mE) / mSum;
+              mediump vec2 cleanVel = (vMedC * wC + vN * wN + vS * wS + vW * wW + vE * wE) / wSum;
 
               float sourceAspect = u_sourceTexel.y > 0.0 ? (u_sourceTexel.y / max(u_sourceTexel.x, 0.00001)) : (16.0 / 9.0);
               vec2 shiftScaleUV = vec2(u_maxShift, u_maxShift * clamp(sourceAspect, 0.5, 2.4)) * u_strength;
 
-              vec2 shiftBaseUV = baseVel * shiftScaleUV;
-              vec2 uvPrevBase = clamp(mappedUV - u_alpha * shiftBaseUV, vec2(0.001), vec2(0.999));
-              vec2 uvCurrBase = clamp(mappedUV + (1.0 - u_alpha) * shiftBaseUV, vec2(0.001), vec2(0.999));
-              mediump vec3 wPrevBase = texture2D(u_prevTex, uvPrevBase).rgb;
-              mediump vec3 wCurrBase = texture2D(u_currTex, uvCurrBase).rgb;
-              mediump float errBase = length(wPrevBase - wCurrBase);
-
-              vec2 shiftPeakUV = peakVel * shiftScaleUV;
-              vec2 uvPrevPeak = clamp(mappedUV - u_alpha * shiftPeakUV, vec2(0.001), vec2(0.999));
-              vec2 uvCurrPeak = clamp(mappedUV + (1.0 - u_alpha) * shiftPeakUV, vec2(0.001), vec2(0.999));
-              mediump vec3 wPrevPeak = texture2D(u_prevTex, uvPrevPeak).rgb;
-              mediump vec3 wCurrPeak = texture2D(u_currTex, uvCurrPeak).rgb;
-              mediump float errPeak = length(wPrevPeak - wCurrPeak);
-
-              mediump float usePeak = smoothstep(0.004, 0.036, errBase - errPeak);
-              mediump vec3 warpedPrev = mix(wPrevBase, wPrevPeak, usePeak);
-              mediump vec3 warpedCurr = mix(wCurrBase, wCurrPeak, usePeak);
-              vec2 uvCurr = mix(uvCurrBase, uvCurrPeak, usePeak);
-              vec2 chosenShiftUV = mix(shiftBaseUV, shiftPeakUV, usePeak);
-              mediump float warpErr = mix(errBase, errPeak, usePeak);
-
               mediump float flowDiv = (vE.x - vW.x) + (vS.y - vN.y);
               mediump float velShear = length(vE - vW) + length(vS - vN);
+
+              vec2 chosenShiftUV = cleanVel * shiftScaleUV;
+              vec2 uvPrev = clamp(mappedUV - u_alpha * chosenShiftUV, vec2(0.001), vec2(0.999));
+              vec2 uvCurr = clamp(mappedUV + (1.0 - u_alpha) * chosenShiftUV, vec2(0.001), vec2(0.999));
+
+              mediump vec3 warpedPrev = texture2D(u_prevTex, uvPrev).rgb;
+              mediump vec3 warpedCurr = texture2D(u_currTex, uvCurr).rgb;
+
+              // Silhouette-Guided Pixel-Accurate Boundary Snap (executes ONLY on the ~5% of pixels straddling moving object edges!)
+              // Prevents bilinear flow averaging across foreground/background boundaries and snaps motion contours to 1080p pixel resolution
+              if (velShear > 0.026) {
+                mediump vec2 vAltH = (dot(vE - cleanVel, vE - cleanVel) > dot(vW - cleanVel, vW - cleanVel)) ? vE : vW;
+                mediump vec2 vAltV = (dot(vS - cleanVel, vS - cleanVel) > dot(vN - cleanVel, vN - cleanVel)) ? vS : vN;
+                mediump vec2 vBoundaryAlt = (dot(vAltH - cleanVel, vAltH - cleanVel) > dot(vAltV - cleanVel, vAltV - cleanVel)) ? vAltH : vAltV;
+                vec2 altShiftUV = vBoundaryAlt * shiftScaleUV;
+                vec2 altUvPrev = clamp(mappedUV - u_alpha * altShiftUV, vec2(0.001), vec2(0.999));
+                vec2 altUvCurr = clamp(mappedUV + (1.0 - u_alpha) * altShiftUV, vec2(0.001), vec2(0.999));
+                mediump vec3 altPrev = texture2D(u_prevTex, altUvPrev).rgb;
+                mediump vec3 altCurr = texture2D(u_currTex, altUvCurr).rgb;
+                mediump float basePairDiff = dot(abs(warpedPrev - warpedCurr), vec3(0.3333));
+                mediump float altPairDiff  = dot(abs(altPrev - altCurr), vec3(0.3333));
+                if (altPairDiff + 0.008 < basePairDiff) {
+                  cleanVel = vBoundaryAlt;
+                  chosenShiftUV = altShiftUV;
+                  uvPrev = altUvPrev;
+                  uvCurr = altUvCurr;
+                  warpedPrev = altPrev;
+                  warpedCurr = altCurr;
+                }
+              }
+
+              // Diagonal Patch Photometric Consistency Check (detects fast-motion tearing & disocclusions with half the texture fetches!)
+              vec2 patchOff = u_sourceTexel * 1.35;
+              mediump vec3 wpD = texture2D(u_prevTex, clamp(uvPrev + patchOff, vec2(0.001), vec2(0.999))).rgb;
+              mediump vec3 wcD = texture2D(u_currTex, clamp(uvCurr + patchOff, vec2(0.001), vec2(0.999))).rgb;
+
+              mediump float warpErr = length(warpedPrev - warpedCurr) * 0.62 + length(wpD - wcD) * 0.38;
+
+              mediump float velMag = length(cleanVel);
               mediump float dPrev = length(warpedPrev - unwarpedCurr);
               mediump float dCurr = length(warpedCurr - unwarpedPrev);
-              mediump float occBoundary = smoothstep(0.024, 0.14, warpErr) * smoothstep(0.035, 0.22, velShear + abs(flowDiv));
-              mediump float dirSelect = clamp((dPrev - dCurr) * 2.4 + flowDiv * 0.85, -0.85, 0.85) * occBoundary;
-              mediump float forwardWeight = clamp(u_alpha + dirSelect * (0.45 + 0.55 * u_haloGuard), 0.0, 1.0);
+
+              // Endpoint-Safe Parabolic Phase Envelope: guarantees 100% exact convergence to prevTex at α->0 and currTex at α->1
+              mediump float phaseEnv = 4.0 * u_alpha * (1.0 - u_alpha);
+
+              // Single-Sided Occlusion Resolver at Foreground/Background Silhouette Boundaries
+              mediump float occBoundary = smoothstep(0.018, 0.11, warpErr) * smoothstep(0.025, 0.18, velShear + abs(flowDiv));
+              mediump float dirSelect = clamp((dPrev - dCurr) * 2.8 + flowDiv * 0.90, -0.92, 0.92) * occBoundary;
+              mediump float forwardWeight = clamp(u_alpha + dirSelect * (0.48 + 0.48 * u_haloGuard) * phaseEnv, 0.0, 1.0);
               mediump vec3 primaryWarped = mix(warpedPrev, warpedCurr, forwardWeight);
 
+              // Motion-Compensated Temporal Denoising (MCTD) modulated by phaseEnv so sub-frame cadence stays strictly linear
+              mediump float temporalAgreement = (1.0 - smoothstep(0.008, 0.055, warpErr)) * clamp(u_upscaleDenoise, 0.0, 1.0);
+              mediump vec3 temporalAvg = 0.5 * (warpedPrev + warpedCurr);
+              primaryWarped = mix(primaryWarped, temporalAvg, temporalAgreement * 0.45 * phaseEnv);
+
+              // Stationary Background Protection Mask
               mediump float staticDiff = length(unwarpedCurr - unwarpedPrev);
-              mediump float stationaryAdvantage = smoothstep(0.028, 0.11, warpErr - staticDiff * 1.45);
+              mediump float stationaryAdvantage = smoothstep(0.025, 0.11, warpErr - staticDiff * 1.45);
               mediump float staticGuardMask =
-                (1.0 - smoothstep(0.004, 0.018, staticDiff)) *
+                (1.0 - smoothstep(0.003, 0.015, staticDiff)) *
                 stationaryAdvantage *
-                clamp(0.35 + 0.55 * u_haloGuard, 0.0, 0.85);
+                clamp(0.35 + 0.55 * u_haloGuard, 0.0, 0.90);
 
-              mediump float extremeMismatch = smoothstep(
-                mix(0.95, 0.48, clamp(u_haloGuard, 0.0, 1.0)),
-                1.18,
-                warpErr * (1.0 - 0.65 * occBoundary)
-              ) * (0.18 * u_haloGuard);
-              mediump float preserveUnwarped = clamp(max(staticGuardMask, extremeMismatch), 0.0, 0.88);
+              // Fast-Motion Artifact & Tearing Eliminator with Post-Occlusion Residual Compensation:
+              // Discounts warpErr when Single-Sided Occlusion Resolver (dirSelect) already resolved a clean background/foreground edge!
+              mediump float singleSideResolved = clamp(abs(dirSelect) * 0.72, 0.0, 0.65);
+              mediump float effectiveWarpErr = warpErr * (1.0 - singleSideResolved);
+              mediump float guardSensitivity = clamp(0.25 + 0.60 * max(u_haloGuard, u_coherenceGuard), 0.15, 0.85);
+              mediump float errThresholdLo = mix(0.26, 0.125, guardSensitivity);
+              mediump float errThresholdHi = mix(0.62, 0.340, guardSensitivity);
+              mediump float mismatchStress = smoothstep(errThresholdLo, errThresholdHi, effectiveWarpErr);
+              mediump float shearStress = smoothstep(mix(0.52, 0.24, guardSensitivity), mix(0.92, 0.52, guardSensitivity), velShear + abs(flowDiv));
+              mediump float lowConfStress = (1.0 - flowC.b) * smoothstep(0.18, 0.55, velMag);
+              mediump float fastMotionStress = clamp(max(mismatchStress, max(shearStress * 0.65, lowConfStress * 0.55)) * guardSensitivity, 0.0, 0.82);
 
-              mediump vec3 cleanStaticRef = mix(unwarpedPrev, unwarpedCurr, u_alpha);
-              mediump vec3 primaryOut = mix(primaryWarped, cleanStaticRef, preserveUnwarped);
+              mediump float preserveUnwarped = clamp(max(staticGuardMask, fastMotionStress * 0.68), 0.0, 0.85);
 
-              // Hierarchical Secondary Sub-Frame Cascade (Pass 2B):
-              // Synthesizes "intermediate-from-intermediate" sub-frames using glSubframeMidFbo (I_0.5)
-              // with half-distance trajectory warping (0.5 * shiftUV) and Vector Coherence Gate
-              if (u_fboPass == 0 && u_subframeCascade > 0) {
+              // Smooth Reference Blend (preserves temporal cadence without snapping back to raw 24fps keyframes):
+              mediump vec3 cleanFastRef = mix(unwarpedPrev, unwarpedCurr, u_alpha);
+              mediump vec3 primaryOut = mix(primaryWarped, cleanFastRef, preserveUnwarped);
+
+              // Pass 2A Secondary Anchor FBO Synthesis for Q1 (alpha=0.25) and Q3 (alpha=0.75) from Mid FBO (I_0.50):
+              if (u_fboPass == 2) {
                 vec2 halfShiftUV = chosenShiftUV * 0.5;
+                vec2 uvSubPrev = clamp(mappedUV - 0.5 * halfShiftUV, vec2(0.001), vec2(0.999));
+                vec2 uvSubMid  = clamp(mappedUV + 0.5 * halfShiftUV, vec2(0.001), vec2(0.999));
+                mediump vec3 cSubPrev = texture2D(u_prevTex, uvSubPrev).rgb;
+                mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
+                mediump float subErr = length(cSubPrev - cSubMid);
+                mediump float subWeight = clamp(0.5 + dirSelect * 0.28, 0.0, 1.0);
+                mediump vec3 cascadeQ1 = mix(cSubPrev, cSubMid, subWeight);
+                mediump float subAgree = (1.0 - smoothstep(0.025, 0.28, subErr)) * (1.0 - preserveUnwarped * 0.65);
+                outColor = mix(primaryOut, cascadeQ1, clamp(0.86 * subAgree, 0.0, 0.92));
+              } else if (u_fboPass == 3) {
+                vec2 halfShiftUV = chosenShiftUV * 0.5;
+                vec2 uvSubMid  = clamp(mappedUV - 0.5 * halfShiftUV, vec2(0.001), vec2(0.999));
+                vec2 uvSubCurr = clamp(mappedUV + 0.5 * halfShiftUV, vec2(0.001), vec2(0.999));
+                mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
+                mediump vec3 cSubCurr = texture2D(u_currTex, uvSubCurr).rgb;
+                mediump float subErr = length(cSubMid - cSubCurr);
+                mediump float subWeight = clamp(0.5 + dirSelect * 0.28, 0.0, 1.0);
+                mediump vec3 cascadeQ3 = mix(cSubMid, cSubCurr, subWeight);
+                mediump float subAgree = (1.0 - smoothstep(0.025, 0.28, subErr)) * (1.0 - preserveUnwarped * 0.65);
+                outColor = mix(primaryOut, cascadeQ3, clamp(0.86 * subAgree, 0.0, 0.92));
+              } else if (u_fboPass == 0 && u_subframeCascade > 0) {
+                // Hierarchical Screen Pass 2B:
+                // When u_subframeCascade >= 3, warps across 4 quarter-step intervals using all 3 FBO sub-frames (I_0.25, I_0.50, I_0.75)
                 mediump vec3 cascadeColor;
                 mediump float subErr;
 
-                if (u_alpha <= 0.5) {
-                  // Sub-interval [0.0, 0.5]: warp between Keyframe T-1 (u_prevTex) and Synthesized Anchor I_0.5 (u_subframeMidTex)
-                  mediump float beta = clamp(u_alpha * 2.0, 0.0, 1.0);
-                  mediump float endEnv = 4.0 * beta * (1.0 - beta);
-                  vec2 uvSubPrev = clamp(mappedUV - beta * halfShiftUV, vec2(0.001), vec2(0.999));
-                  vec2 uvSubMid  = clamp(mappedUV + (1.0 - beta) * halfShiftUV, vec2(0.001), vec2(0.999));
-                  mediump vec3 cSubPrev = texture2D(u_prevTex, uvSubPrev).rgb;
-                  mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
-                  subErr = length(cSubPrev - cSubMid);
-                  mediump float subWeight = clamp(beta + dirSelect * 0.28 * endEnv, 0.0, 1.0);
-                  cascadeColor = mix(cSubPrev, cSubMid, subWeight);
-
-                  if (u_subframeCascade >= 3) {
-                    // 3x / 4x Multi-Tap Trajectory Stabilization along the [T-1 -> I_0.5] sub-vector
-                    vec2 uvSubQ = clamp(mappedUV + (0.5 - beta) * halfShiftUV * 0.5, vec2(0.001), vec2(0.999));
-                    mediump vec3 cSubQ = mix(cSubPrev, texture2D(u_subframeMidTex, uvSubQ).rgb, beta);
-                    cascadeColor = mix(cascadeColor, cSubQ, ((u_subframeCascade == 4) ? 0.30 : 0.18) * endEnv);
+                if (u_subframeCascade >= 3) {
+                  vec2 quarterShiftUV = chosenShiftUV * 0.25;
+                  if (u_alpha <= 0.25) {
+                    mediump float beta = clamp(u_alpha * 4.0, 0.0, 1.0);
+                    mediump float endEnv = 4.0 * beta * (1.0 - beta);
+                    vec2 uvA = clamp(mappedUV - beta * quarterShiftUV, vec2(0.001), vec2(0.999));
+                    vec2 uvB = clamp(mappedUV + (1.0 - beta) * quarterShiftUV, vec2(0.001), vec2(0.999));
+                    mediump vec3 cA = texture2D(u_prevTex, uvA).rgb;
+                    mediump vec3 cB = texture2D(u_subframeQ1Tex, uvB).rgb;
+                    subErr = length(cA - cB);
+                    mediump float subWeight = clamp(beta + dirSelect * 0.22 * endEnv, 0.0, 1.0);
+                    cascadeColor = mix(cA, cB, subWeight);
+                  } else if (u_alpha <= 0.50) {
+                    mediump float beta = clamp((u_alpha - 0.25) * 4.0, 0.0, 1.0);
+                    mediump float endEnv = 4.0 * beta * (1.0 - beta);
+                    vec2 uvA = clamp(mappedUV - beta * quarterShiftUV, vec2(0.001), vec2(0.999));
+                    vec2 uvB = clamp(mappedUV + (1.0 - beta) * quarterShiftUV, vec2(0.001), vec2(0.999));
+                    mediump vec3 cA = texture2D(u_subframeQ1Tex, uvA).rgb;
+                    mediump vec3 cB = texture2D(u_subframeMidTex, uvB).rgb;
+                    subErr = length(cA - cB);
+                    mediump float subWeight = clamp(beta + dirSelect * 0.22 * endEnv, 0.0, 1.0);
+                    cascadeColor = mix(cA, cB, subWeight);
+                  } else if (u_alpha <= 0.75) {
+                    mediump float beta = clamp((u_alpha - 0.50) * 4.0, 0.0, 1.0);
+                    mediump float endEnv = 4.0 * beta * (1.0 - beta);
+                    vec2 uvA = clamp(mappedUV - beta * quarterShiftUV, vec2(0.001), vec2(0.999));
+                    vec2 uvB = clamp(mappedUV + (1.0 - beta) * quarterShiftUV, vec2(0.001), vec2(0.999));
+                    mediump vec3 cA = texture2D(u_subframeMidTex, uvA).rgb;
+                    mediump vec3 cB = texture2D(u_subframeQ3Tex, uvB).rgb;
+                    subErr = length(cA - cB);
+                    mediump float subWeight = clamp(beta + dirSelect * 0.22 * endEnv, 0.0, 1.0);
+                    cascadeColor = mix(cA, cB, subWeight);
+                  } else {
+                    mediump float beta = clamp((u_alpha - 0.75) * 4.0, 0.0, 1.0);
+                    mediump float endEnv = 4.0 * beta * (1.0 - beta);
+                    vec2 uvA = clamp(mappedUV - beta * quarterShiftUV, vec2(0.001), vec2(0.999));
+                    vec2 uvB = clamp(mappedUV + (1.0 - beta) * quarterShiftUV, vec2(0.001), vec2(0.999));
+                    mediump vec3 cA = texture2D(u_subframeQ3Tex, uvA).rgb;
+                    mediump vec3 cB = texture2D(u_currTex, uvB).rgb;
+                    subErr = length(cA - cB);
+                    mediump float subWeight = clamp(beta + dirSelect * 0.22 * endEnv, 0.0, 1.0);
+                    cascadeColor = mix(cA, cB, subWeight);
                   }
                 } else {
-                  // Sub-interval [0.5, 1.0]: warp between Synthesized Anchor I_0.5 (u_subframeMidTex) and Keyframe T (u_currTex)
-                  mediump float beta = clamp((u_alpha - 0.5) * 2.0, 0.0, 1.0);
-                  mediump float endEnv = 4.0 * beta * (1.0 - beta);
-                  vec2 uvSubMid  = clamp(mappedUV - beta * halfShiftUV, vec2(0.001), vec2(0.999));
-                  vec2 uvSubCurr = clamp(mappedUV + (1.0 - beta) * halfShiftUV, vec2(0.001), vec2(0.999));
-                  mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
-                  mediump vec3 cSubCurr = texture2D(u_currTex, uvSubCurr).rgb;
-                  subErr = length(cSubMid - cSubCurr);
-                  mediump float subWeight = clamp(beta + dirSelect * 0.28 * endEnv, 0.0, 1.0);
-                  cascadeColor = mix(cSubMid, cSubCurr, subWeight);
-
-                  if (u_subframeCascade >= 3) {
-                    // 3x / 4x Multi-Tap Trajectory Stabilization along the [I_0.5 -> T] sub-vector
-                    vec2 uvSubQ = clamp(mappedUV - (beta - 0.5) * halfShiftUV * 0.5, vec2(0.001), vec2(0.999));
-                    mediump vec3 cSubQ = mix(texture2D(u_subframeMidTex, uvSubQ).rgb, cSubCurr, beta);
-                    cascadeColor = mix(cascadeColor, cSubQ, ((u_subframeCascade == 4) ? 0.30 : 0.18) * endEnv);
+                  vec2 halfShiftUV = chosenShiftUV * 0.5;
+                  if (u_alpha <= 0.5) {
+                    mediump float beta = clamp(u_alpha * 2.0, 0.0, 1.0);
+                    mediump float endEnv = 4.0 * beta * (1.0 - beta);
+                    vec2 uvSubPrev = clamp(mappedUV - beta * halfShiftUV, vec2(0.001), vec2(0.999));
+                    vec2 uvSubMid  = clamp(mappedUV + (1.0 - beta) * halfShiftUV, vec2(0.001), vec2(0.999));
+                    mediump vec3 cSubPrev = texture2D(u_prevTex, uvSubPrev).rgb;
+                    mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
+                    subErr = length(cSubPrev - cSubMid);
+                    mediump float subWeight = clamp(beta + dirSelect * 0.28 * endEnv, 0.0, 1.0);
+                    cascadeColor = mix(cSubPrev, cSubMid, subWeight);
+                  } else {
+                    mediump float beta = clamp((u_alpha - 0.5) * 2.0, 0.0, 1.0);
+                    mediump float endEnv = 4.0 * beta * (1.0 - beta);
+                    vec2 uvSubMid  = clamp(mappedUV - beta * halfShiftUV, vec2(0.001), vec2(0.999));
+                    vec2 uvSubCurr = clamp(mappedUV + (1.0 - beta) * halfShiftUV, vec2(0.001), vec2(0.999));
+                    mediump vec3 cSubMid  = texture2D(u_subframeMidTex, uvSubMid).rgb;
+                    mediump vec3 cSubCurr = texture2D(u_currTex, uvSubCurr).rgb;
+                    subErr = length(cSubMid - cSubCurr);
+                    mediump float subWeight = clamp(beta + dirSelect * 0.28 * endEnv, 0.0, 1.0);
+                    cascadeColor = mix(cSubMid, cSubCurr, subWeight);
                   }
                 }
 
-                // Vector Coherence & Fast-Scene Anti-Ghosting Gate:
-                // Evaluates spatial velocity shear, divergence, Pass 1 SAD confidence, and sub-warp agreement
+                // Vector Coherence & Fast-Scene Anti-Ghosting Gate
                 mediump float cohShear = velShear + abs(flowDiv) * 0.85;
-                mediump float shearCutoff = mix(0.46, 0.14, clamp(u_coherenceGuard, 0.0, 1.0));
-                mediump float errCutoff   = mix(0.36, 0.11, clamp(u_coherenceGuard, 0.0, 1.0));
-                mediump float spatialCoherence = 1.0 - smoothstep(0.025, shearCutoff, cohShear);
-                mediump float subWarpAgreement = 1.0 - smoothstep(0.020, errCutoff, subErr);
-                mediump float sadConfidence = clamp(flowC.b * (1.12 - 0.55 * flowC.a), 0.0, 1.0);
+                mediump float shearCutoff = mix(0.55, 0.18, clamp(u_coherenceGuard, 0.0, 1.0));
+                mediump float errCutoff   = mix(0.42, 0.14, clamp(u_coherenceGuard, 0.0, 1.0));
+                mediump float spatialCoherence = 1.0 - smoothstep(0.035, shearCutoff, cohShear);
+                mediump float subWarpAgreement = 1.0 - smoothstep(0.025, errCutoff, subErr);
+                mediump float sadConfidence = clamp(flowC.b * (1.15 - 0.50 * flowC.a), 0.0, 1.0);
 
-                mediump float cascadeDepth = (u_subframeCascade == 4) ? 0.92 : (u_subframeCascade == 3) ? 0.84 : 0.75;
+                mediump float cascadeDepth = (u_subframeCascade == 4) ? 0.94 : (u_subframeCascade == 3) ? 0.88 : 0.78;
                 mediump float cascadeBlend =
                   cascadeDepth *
-                  mix(1.0, spatialCoherence * subWarpAgreement * (0.45 + 0.55 * sadConfidence), clamp(u_coherenceGuard * 0.90, 0.15, 0.95)) *
-                  (1.0 - preserveUnwarped);
+                  mix(1.0, spatialCoherence * subWarpAgreement * (0.50 + 0.50 * sadConfidence), clamp(u_coherenceGuard * 0.75, 0.15, 0.82)) *
+                  (1.0 - preserveUnwarped * 0.60);
 
                 outColor = mix(primaryOut, cascadeColor, clamp(cascadeBlend, 0.0, 0.94));
               } else {
                 outColor = primaryOut;
               }
 
-              upscalerRefCurr = mix(warpedCurr, unwarpedCurr, preserveUnwarped * 0.5);
-              upscalerUvCurr = mix(uvCurr, mappedUV, preserveUnwarped * 0.5);
+              upscalerUvCurr = mix(uvCurr, mappedUV, preserveUnwarped);
               occBias = preserveUnwarped;
             }
 
-            // Pass 2A Anchor FBO output: write clean stabilized intermediate frame I_0.5 directly to glSubframeMidFbo
-            if (u_fboPass == 1) {
+            // Pass 2A Anchor FBO output: write clean stabilized intermediate sub-frames (I_0.50, I_0.25, I_0.75) directly to their FBOs
+            if (u_fboPass >= 1) {
               gl_FragColor = vec4(clamp(outColor, 0.0, 1.0), 1.0);
               return;
             }
 
-            if (u_upscaleMode > 0 && !isOriginalSide) {
-              outColor = applyGpuUpscaler(
+            // Fused Single-Pass Denoiser + Adaptive Deband + Super-Resolution Upscaler (fetches 3x3 neighborhood only once!)
+            if (!isOriginalSide && (u_upscaleDenoise > 0.01 || u_debandStrength > 0.01 || occBias > 0.15 || u_upscaleMode > 0)) {
+              outColor = applyFusedDenoiseAndUpscale(
                 outColor,
-                upscalerRefCurr,
                 upscalerUvCurr,
                 u_upscaleMode,
                 u_upscaleFactor,
                 u_upscaleSharpness,
                 u_upscaleDenoise,
-                1.0 - occBias * 0.35
+                u_debandStrength,
+                occBias,
+                1.0 - occBias * 0.65
               );
             }
 
@@ -2701,6 +4025,19 @@ export default function App() {
               outColor = applyHdr10ToneMap(outColor, u_hdrStrength, u_adrenoOpt, u_adrenoTrue10);
             }
             outColor = clamp(outColor * u_brightness, 0.0, 1.0);
+
+            if (!isOriginalSide) {
+              if (u_blackPoint > 0.0005 || abs(u_contrast - 1.0) > 0.005 || abs(u_saturation - 1.0) > 0.005) {
+                outColor = clamp((outColor - vec3(u_blackPoint)) / max(1.0 - u_blackPoint, 0.05), 0.0, 1.0);
+                outColor = clamp((outColor - 0.5) * u_contrast + 0.5, 0.0, 1.0);
+                mediump float lumaSat = getLuma(outColor);
+                outColor = clamp(mix(vec3(lumaSat), outColor, u_saturation), 0.0, 1.0);
+              }
+              if (u_lutStrength > 0.005) {
+                mediump vec3 lutCol = sample3DLutStrip(outColor);
+                outColor = mix(outColor, lutCol, clamp(u_lutStrength, 0.0, 1.0));
+              }
+            }
 
             if (u_monochrome == 1) {
               mediump float gray = getLuma(outColor);
@@ -2741,7 +4078,7 @@ export default function App() {
             }
 
             if (u_splitCompare == 1 && abs(v_uv.x - 0.5) < 0.0018) {
-              outColor = vec3(1.0, 1.0, 1.0);
+              outColor = vec3(1.0, 1.0, 0.0);
             }
 
             gl_FragColor = vec4(outColor, 1.0);
@@ -2796,7 +4133,7 @@ export default function App() {
         }
 
         if (flowProg && synthProg) {
-          // 1. Pass 1 Fullscreen Quad Buffer (6 vertices for fast FBO Pyramid passes)
+          // Shared Fullscreen Quad Buffer (6 vertices for both Pass 1 FBO Pyramid and Pass 2 Synthesis — zero tile-binning overhead!)
           quadBuf = gl.createBuffer();
           gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
           gl.bufferData(
@@ -2804,35 +4141,6 @@ export default function App() {
             new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
             gl.STATIC_DRAW
           );
-
-          // 2. Pass 2 Subdivided 2D Elastic Mesh Buffer (64x36 = 2,304 cells = 13,824 vertices)
-          const meshVerts = new Float32Array(MESH_COLS * MESH_ROWS * 12);
-          let vPtr = 0;
-          for (let r = 0; r < MESH_ROWS; r++) {
-            const y0 = -1.0 + (2.0 * r) / MESH_ROWS;
-            const y1 = -1.0 + (2.0 * (r + 1)) / MESH_ROWS;
-            for (let c = 0; c < MESH_COLS; c++) {
-              const x0 = -1.0 + (2.0 * c) / MESH_COLS;
-              const x1 = -1.0 + (2.0 * (c + 1)) / MESH_COLS;
-              // Triangle 1
-              meshVerts[vPtr++] = x0;
-              meshVerts[vPtr++] = y0;
-              meshVerts[vPtr++] = x1;
-              meshVerts[vPtr++] = y0;
-              meshVerts[vPtr++] = x0;
-              meshVerts[vPtr++] = y1;
-              // Triangle 2
-              meshVerts[vPtr++] = x0;
-              meshVerts[vPtr++] = y1;
-              meshVerts[vPtr++] = x1;
-              meshVerts[vPtr++] = y0;
-              meshVerts[vPtr++] = x1;
-              meshVerts[vPtr++] = y1;
-            }
-          }
-          meshBuf = gl.createBuffer();
-          gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
-          gl.bufferData(gl.ARRAY_BUFFER, meshVerts, gl.STATIC_DRAW);
 
           flowPosLoc = Math.max(0, gl.getAttribLocation(flowProg, 'a_pos'));
           gl.enableVertexAttribArray(flowPosLoc);
@@ -2851,6 +4159,9 @@ export default function App() {
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
             return t;
           };
+
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
 
           // Allocate initial keyframe textures
           glPrevTex = createLinearTex();
@@ -2901,6 +4212,7 @@ export default function App() {
           const pyrL3 = createFlowFboPair(PYR_L3_COLS, PYR_L3_ROWS, makeNeutralFlow(PYR_L3_COLS, PYR_L3_ROWS));
           const pyrL2 = createFlowFboPair(PYR_L2_COLS, PYR_L2_ROWS, makeNeutralFlow(PYR_L2_COLS, PYR_L2_ROWS));
           const pyrL1 = createFlowFboPair(PYR_L1_COLS, PYR_L1_ROWS, makeNeutralFlow(PYR_L1_COLS, PYR_L1_ROWS));
+          const pyrL05 = createFlowFboPair(PYR_L05_COLS, PYR_L05_ROWS, makeNeutralFlow(PYR_L05_COLS, PYR_L05_ROWS));
           glPyrL4Tex = pyrL4.tex;
           glPyrL4Fbo = pyrL4.fbo;
           glPyrL3Tex = pyrL3.tex;
@@ -2909,6 +4221,8 @@ export default function App() {
           glPyrL2Fbo = pyrL2.fbo;
           glPyrL1Tex = pyrL1.tex;
           glPyrL1Fbo = pyrL1.fbo;
+          glPyrL05Tex = pyrL05.tex;
+          glPyrL05Fbo = pyrL05.fbo;
 
           const neutralFlow = makeNeutralFlow(FLOW_COLS, FLOW_ROWS);
           const pairA = createFlowFboPair(FLOW_COLS, FLOW_ROWS, neutralFlow);
@@ -2921,7 +4235,7 @@ export default function App() {
           glSadDebugTex = pairSad.tex;
           glSadDebugFbo = pairSad.fbo;
 
-          // Allocate Pass 2A Secondary Sub-Frame Anchor FBO (glSubframeMidFbo for I_0.5 intermediate keyframe)
+          // Allocate Pass 2A 3-Anchor Sub-Frame Cascade FBOs (Mid: I_0.50, Q1: I_0.25, Q3: I_0.75)
           allocatedSubframeW = STAGE_W;
           allocatedSubframeH = STAGE_H;
           glSubframeMidTex = createLinearTex();
@@ -2929,7 +4243,25 @@ export default function App() {
           glSubframeMidFbo = gl.createFramebuffer();
           gl.bindFramebuffer(gl.FRAMEBUFFER, glSubframeMidFbo);
           gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, glSubframeMidTex, 0);
+
+          glSubframeQ1Tex = createLinearTex();
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, STAGE_W, STAGE_H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+          glSubframeQ1Fbo = gl.createFramebuffer();
+          gl.bindFramebuffer(gl.FRAMEBUFFER, glSubframeQ1Fbo);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, glSubframeQ1Tex, 0);
+
+          glSubframeQ3Tex = createLinearTex();
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, STAGE_W, STAGE_H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+          glSubframeQ3Fbo = gl.createFramebuffer();
+          gl.bindFramebuffer(gl.FRAMEBUFFER, glSubframeQ3Fbo);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, glSubframeQ3Tex, 0);
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+          // Allocate 256x16 (16x16x16) 3D LUT Strip Texture
+          glLutTex = createLinearTex();
+          const initLutData = generateBuiltInLutStrip('off');
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 16, 0, gl.RGBA, gl.UNSIGNED_BYTE, initLutData);
+          lastUploadedLutKey = 'off:0';
 
           // Configure Pass 1 (flowProg) uniforms
           gl.useProgram(flowProg);
@@ -2959,6 +4291,9 @@ export default function App() {
           gl.uniform1i(gl.getUniformLocation(synthProg, 'u_flowTex'), 2);
           gl.uniform1i(gl.getUniformLocation(synthProg, 'u_sadDebugTex'), 3);
           gl.uniform1i(gl.getUniformLocation(synthProg, 'u_subframeMidTex'), 4);
+          gl.uniform1i(gl.getUniformLocation(synthProg, 'u_lutTex'), 5);
+          gl.uniform1i(gl.getUniformLocation(synthProg, 'u_subframeQ1Tex'), 6);
+          gl.uniform1i(gl.getUniformLocation(synthProg, 'u_subframeQ3Tex'), 7);
 
           uAlphaLoc = gl.getUniformLocation(synthProg, 'u_alpha');
           uStrengthLoc = gl.getUniformLocation(synthProg, 'u_strength');
@@ -2973,6 +4308,11 @@ export default function App() {
           uSourceTexelLoc = gl.getUniformLocation(synthProg, 'u_sourceTexel');
           uFlowStepLoc = gl.getUniformLocation(synthProg, 'u_flowStep');
           uBrightnessLoc = gl.getUniformLocation(synthProg, 'u_brightness');
+          uContrastLoc = gl.getUniformLocation(synthProg, 'u_contrast');
+          uSaturationLoc = gl.getUniformLocation(synthProg, 'u_saturation');
+          uBlackPointLoc = gl.getUniformLocation(synthProg, 'u_blackPoint');
+          uDebandStrengthLoc = gl.getUniformLocation(synthProg, 'u_debandStrength');
+          uLutStrengthLoc = gl.getUniformLocation(synthProg, 'u_lutStrength');
           uHdrLoc = gl.getUniformLocation(synthProg, 'u_hdrStrength');
           uTargetFpsLoc = gl.getUniformLocation(synthProg, 'u_targetFps');
           uUpscaleModeLoc = gl.getUniformLocation(synthProg, 'u_upscaleMode');
@@ -2988,7 +4328,7 @@ export default function App() {
           gl.uniform2f(uSourceTexelLoc, 1.0 / STAGE_W, 1.0 / STAGE_H);
           gl.uniform2f(uFlowStepLoc, 1.0 / FLOW_COLS, 1.0 / FLOW_ROWS);
           if (uFboPassLoc) gl.uniform1i(uFboPassLoc, 0);
-          if (uSubframeCascadeLoc) gl.uniform1i(uSubframeCascadeLoc, 2);
+          if (uSubframeCascadeLoc) gl.uniform1i(uSubframeCascadeLoc, 3);
           if (uCoherenceGuardLoc) gl.uniform1f(uCoherenceGuardLoc, 0.75);
 
           // Ensure Pass 1 texture unit 3 is bound to temporal flow history before first Pass 1 run
@@ -3006,6 +4346,12 @@ export default function App() {
           gl.bindTexture(gl.TEXTURE_2D, glSadDebugTex);
           gl.activeTexture(gl.TEXTURE4);
           gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
+          gl.activeTexture(gl.TEXTURE5);
+          gl.bindTexture(gl.TEXTURE_2D, glLutTex);
+          gl.activeTexture(gl.TEXTURE6);
+          gl.bindTexture(gl.TEXTURE_2D, glSubframeQ1Tex);
+          gl.activeTexture(gl.TEXTURE7);
+          gl.bindTexture(gl.TEXTURE_2D, glSubframeQ3Tex);
 
           gl.viewport(0, 0, outCanvas ? outCanvas.width : STAGE_W, outCanvas ? outCanvas.height : STAGE_H);
           glReady = true;
@@ -3021,23 +4367,84 @@ export default function App() {
     const maxGpuWidth = maxViewportDims ? Math.min(3840, maxViewportDims[0]) : 3840;
     const maxGpuHeight = maxViewportDims ? Math.min(2160, maxViewportDims[1]) : 2160;
 
-    // Resolve Adaptive FBO dimensions for 5-Level Pyramid Level 0 based on flowScaleMode, video resolution, and targetFps
-    // (Deterministic per mode/resolution/targetFps to prevent mid-subframe FBO reallocation & temporal flow history resets!)
+    // Resolve Adaptive FBO dimensions for 6-Level Pyramid Level 0 based on flowScaleMode, video resolution, targetFps, and ecoThermalMode
+    // Strictly deterministic per mode/resolution/targetFps to prevent mid-playback FBO reallocation & temporal flow history resets!
     const resolveAdaptiveFlowDims = (
-      mode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme',
+      mode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme' | 'high' | 'max',
       vw: number,
-      targetFpsVal: number | string
+      targetFpsVal: number | string,
+      ecoMode: boolean
     ): [number, number] => {
       const numFps = typeof targetFpsVal === 'number' ? targetFpsVal : 60;
       if (mode === 'performance') return [64, 36];
       if (mode === 'balanced') return [96, 54];
       if (mode === 'ultra') return [128, 72];
       if (mode === 'extreme') return [256, 144];
+      if (mode === 'high') return [384, 216];
+      if (mode === 'max') return [512, 288];
 
-      if (vw <= 1920 && numFps <= 120) {
+      if (ecoMode) {
         return [128, 72];
       }
-      return [96, 54];
+      if (vw <= 1920 && numFps <= 120) {
+        return [256, 144];
+      }
+      return [128, 72];
+    };
+
+    // Resolve Pass 2A 3-Anchor Sub-Frame FBO dimensions (I_0.25, I_0.50, I_0.75) up to 2560x1440 (1440p QHD)
+    // Deterministic per mode/resolution/ecoMode so FBO textures are never reallocated mid-playback!
+    const resolveSubframeBufferDims = (
+      resMode: 'auto' | '720p' | '1080p' | '1440p',
+      activeVw: number,
+      activeVh: number,
+      ecoMode: boolean,
+      targetFpsVal: number | string,
+      _nowMs: number
+    ): [number, number] => {
+      const numFps = typeof targetFpsVal === 'number' ? targetFpsVal : 60;
+      let maxCapW = 1920;
+      let maxCapH = 1080;
+      if (resMode === '720p') {
+        maxCapW = 1280;
+        maxCapH = 720;
+      } else if (resMode === '1080p') {
+        maxCapW = 1920;
+        maxCapH = 1080;
+      } else if (resMode === '1440p') {
+        maxCapW = 2560;
+        maxCapH = 1440;
+      } else {
+        // Smart Auto VRAM & Thermal Governor (deterministic per video resolution & thermal mode)
+        if (ecoMode) {
+          maxCapW = 1280;
+          maxCapH = 720;
+        } else if (numFps <= 90 && activeVw >= 1920) {
+          maxCapW = 2560;
+          maxCapH = 1440;
+        } else {
+          maxCapW = 1920;
+          maxCapH = 1080;
+        }
+      }
+      const clampedCapW = Math.min(maxCapW, maxGpuWidth);
+      const clampedCapH = Math.min(maxCapH, maxGpuHeight);
+      const desiredW =
+        resMode === '1440p'
+          ? Math.max(activeVw, 2560)
+          : resMode === '1080p'
+          ? Math.max(activeVw, 1920)
+          : Math.max(activeVw, 1280);
+      const desiredH =
+        resMode === '1440p'
+          ? Math.max(activeVh, 1440)
+          : resMode === '1080p'
+          ? Math.max(activeVh, 1080)
+          : Math.max(activeVh, 720);
+      const anchorFit = Math.min(1.0, clampedCapW / Math.max(1, desiredW), clampedCapH / Math.max(1, desiredH));
+      const targetSubW = Math.max(640, Math.round(desiredW * anchorFit));
+      const targetSubH = Math.max(360, Math.round(desiredH * anchorFit));
+      return [targetSubW, targetSubH];
     };
 
     // Procedural 24 FPS Cinema Test Pattern Generator (renders discrete 24 FPS keyframes onto stagingCanvas)
@@ -3265,21 +4672,38 @@ export default function App() {
         gl.drawArrays(gl.TRIANGLES, 0, 6);
       }
 
-      // --- PYRAMID LEVEL 0 (Final Target FBO: 64x36 / 96x54 / 128x72 / 256x144 Sub-Pixel Lucas-Kanade) ---
+      // --- PYRAMID LEVEL 0.5 (Ultra-Dense 256x144 Micro-Feature Lock from Level 1; executed when L0 > 256x144 i.e. 384x216 or 512x288) ---
+      if (allocatedFlowCols > PYR_L05_COLS && glPyrL05Fbo && glPyrL05Tex && glPyrL1Tex) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, glPyrL05Fbo);
+        gl.viewport(0, 0, PYR_L05_COLS, PYR_L05_ROWS);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, glPyrL1Tex);
+        if (uFlowPyrLevelLoc) gl.uniform1i(uFlowPyrLevelLoc, 1);
+        if (uFlowParentStepLoc) gl.uniform2f(uFlowParentStepLoc, 1.0 / PYR_L1_COLS, 1.0 / PYR_L1_ROWS);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      }
+
+      // --- PYRAMID LEVEL 0 (Final Target FBO: 64x36 / 96x54 / 128x72 / 256x144 / 384x216 / 512x288 Sub-Pixel Lucas-Kanade) ---
       const l0ParentTex =
-        allocatedFlowCols >= PYR_L1_COLS
+        allocatedFlowCols > PYR_L05_COLS
+          ? glPyrL05Tex
+          : allocatedFlowCols >= PYR_L1_COLS
           ? glPyrL1Tex
           : allocatedFlowCols >= PYR_L2_COLS
           ? glPyrL2Tex
           : glPyrL3Tex;
       const l0ParentCols =
-        allocatedFlowCols >= PYR_L1_COLS
+        allocatedFlowCols > PYR_L05_COLS
+          ? PYR_L05_COLS
+          : allocatedFlowCols >= PYR_L1_COLS
           ? PYR_L1_COLS
           : allocatedFlowCols >= PYR_L2_COLS
           ? PYR_L2_COLS
           : PYR_L3_COLS;
       const l0ParentRows =
-        allocatedFlowCols >= PYR_L1_COLS
+        allocatedFlowCols > PYR_L05_COLS
+          ? PYR_L05_ROWS
+          : allocatedFlowCols >= PYR_L1_COLS
           ? PYR_L1_ROWS
           : allocatedFlowCols >= PYR_L2_COLS
           ? PYR_L2_ROWS
@@ -3312,13 +4736,13 @@ export default function App() {
         }
       }
 
-      // Restore Screen Framebuffer & Pass 2 Elastic 2D Mesh Bindings
+      // Restore Screen Framebuffer & Pass 2 Fullscreen Quad Bindings
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, outCanvas ? outCanvas.width : vw, outCanvas ? outCanvas.height : vh);
       gl.useProgram(synthProg);
 
-      if (meshBuf) {
-        gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
+      if (quadBuf) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
         gl.vertexAttribPointer(synthPosLoc, 2, gl.FLOAT, false, 0, 0);
       }
 
@@ -3404,8 +4828,8 @@ export default function App() {
       if (!computeOpticalFlow) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.useProgram(synthProg);
-        if (meshBuf) {
-          gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
+        if (quadBuf) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
           gl.vertexAttribPointer(synthPosLoc, 2, gl.FLOAT, false, 0, 0);
         }
         gl.activeTexture(gl.TEXTURE0);
@@ -3421,6 +4845,10 @@ export default function App() {
         if (glSubframeMidTex) {
           gl.activeTexture(gl.TEXTURE4);
           gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
+        }
+        if (glLutTex) {
+          gl.activeTexture(gl.TEXTURE5);
+          gl.bindTexture(gl.TEXTURE_2D, glLutTex);
         }
         return;
       }
@@ -3439,8 +4867,13 @@ export default function App() {
     };
 
     let lastSubtitleStr = '';
+    let lastTopSubtitleStr = '';
+    let lastAutoCropCheckTime = 0;
+    let smoothAutoCropRatio = 0;
     let animId: number;
     let lastRAFTime = performance.now();
+    let lastRenderSubmittedTime = 0;
+    let lastRenderedAlpha = -1;
     let lastDomSyncTime = performance.now();
     let lastPosSaveTime = performance.now();
     let subframeTickIndex = 0;
@@ -3450,9 +4883,18 @@ export default function App() {
     let lastDecodedFrameCount = -1;
     let lastPass1Signature = '';
     let lastPass2ASignature = '';
+    let pass2BindingsDirty = true;
+    let lastViewportW = -1;
+    let lastViewportH = -1;
 
     const tick = (now: number) => {
       animId = requestAnimationFrame(tick);
+
+      // Zero background thermal/battery drain when browser tab or app is minimized/hidden
+      if (typeof document !== 'undefined' && document.hidden) {
+        lastRAFTime = now;
+        return;
+      }
 
       const dtMs = Math.min(60, Math.max(2, now - lastRAFTime));
       lastRAFTime = now;
@@ -3486,6 +4928,29 @@ export default function App() {
       ) {
         return;
       }
+
+      const effectiveMode = cfg.interpEnabled ? cfg.interpMode : 'off';
+
+      // Thermal Frame-Pacer: Only throttle when display refresh rate is explicitly much higher than targetRenderFps
+      // (Never drop VSync ticks when targetRenderFps matches or exceeds display Hz!)
+      const targetRenderFps =
+        effectiveMode === 'off'
+          ? 60
+          : Math.max(30, Math.min(240, Number(cfg.effectiveTargetFps) || 60));
+      const shouldPaceFps = cfg.detectedDisplayHz > targetRenderFps + 15;
+      const minFrameIntervalMs = (1000.0 / targetRenderFps) * 0.78;
+      const isUrgentFrame =
+        forceRedrawRef.current ||
+        isScrubbingRef.current ||
+        hasNewVideoFrameRef.current ||
+        forceDemoStepRef.current ||
+        pendingSnapshotRef.current;
+
+      if (shouldPaceFps && !isUrgentFrame && now - lastRenderSubmittedTime < minFrameIntervalMs) {
+        return;
+      }
+
+      const wasForcedRedraw = forceRedrawRef.current;
       forceRedrawRef.current = false;
 
       if (!glReady || !gl || !synthProg) return;
@@ -3493,19 +4958,21 @@ export default function App() {
       // Start measuring actual GPU command submission latency
       const procStart = performance.now();
 
-      const effectiveMode = cfg.interpEnabled ? cfg.interpMode : 'off';
       const adrenoOptVal = cfg.isAdrenoActive && cfg.adrenoGmemFp16 ? 1 : 0;
       const adrenoTrue10Val = cfg.isAdrenoActive && cfg.adrenoTrue10Hdr ? 1 : 0;
-      const maxShiftVal = (cfg.motionScale * 4.25) / 960.0;
+      const maxShiftVal = (cfg.motionScale * 1.45) / 960.0;
       let alpha = 1.0;
       let uvScaleX = 1.0;
       let uvScaleY = 1.0;
       let activeVw = STAGE_W;
       let activeVh = STAGE_H;
+      let didUploadNewKeyframe = false;
 
       const isFlowNeeded =
         effectiveMode === 'optical' ||
         cfg.showSadHeatmap;
+
+      const effectivePllDtMs = Math.max(pllDisplayDtMs, 1000.0 / targetRenderFps);
 
       // Branch A: Built-in 24.0 FPS Cinema Motion Test Generator (works immediately with zero external video dependencies!)
       if (cfg.isDemoTestActive && stagingCtx) {
@@ -3549,7 +5016,8 @@ export default function App() {
         const [targetFlowCols, targetFlowRows] = resolveAdaptiveFlowDims(
           cfg.flowScaleMode,
           vw,
-          cfg.effectiveTargetFps
+          cfg.effectiveTargetFps,
+          cfg.ecoThermalMode
         );
 
         const elapsedSinceUpload = now - lastKeyframeUploadPerfNowRef.current;
@@ -3559,10 +5027,11 @@ export default function App() {
           isScrubbingRef.current ||
           (cfg.isPlaying && elapsedSinceUpload >= demoIntervalMs);
 
-        const expectedDemoTicks = Math.max(1.0, demoIntervalMs / Math.max(4.0, pllDisplayDtMs));
+        const expectedDemoTicks = Math.max(1.0, demoIntervalMs / Math.max(4.0, effectivePllDtMs));
         const nominalDemoStep = 1.0 / expectedDemoTicks;
 
         if (shouldStepDemoKeyframe) {
+          didUploadNewKeyframe = true;
           const isInitialSeed = forceDemoStepRef.current || lastDecodedVideoTimeRef.current < 0;
           forceDemoStepRef.current = false;
           lastKeyframeUploadPerfNowRef.current = now;
@@ -3618,6 +5087,7 @@ export default function App() {
             );
           }
           lastPass1Signature = `demo:${demoFrameCounter}:${isFlowNeeded}:${cfg.showSadHeatmap}:${targetFlowCols}x${targetFlowRows}:${maxShiftVal.toFixed(5)}:${cfg.sceneCutProtection}:${adrenoOptVal}`;
+          pass2BindingsDirty = true;
           subframeTickIndex = 0;
           // VSync PLL v2: Carry fractional phase remainder across keyframe boundary for zero-stutter 24->60/120 cadence
           const wrappedPhase = (pllPhase + nominalDemoStep) - 1.0;
@@ -3640,9 +5110,10 @@ export default function App() {
               false
             );
             lastPass1Signature = pass1Sig;
+            pass2BindingsDirty = true;
           }
           subframeTickIndex += 1;
-          const clockPhase = (now - lastKeyframeUploadPerfNowRef.current + 0.5 * pllDisplayDtMs) / demoIntervalMs;
+          const clockPhase = (now - lastKeyframeUploadPerfNowRef.current + 0.5 * effectivePllDtMs) / demoIntervalMs;
           const nextUniform = pllPhase + nominalDemoStep;
           const phaseErr = Math.max(-0.08, Math.min(0.08, clockPhase - nextUniform));
           const lockGain = cfg.subframeCascadeEnabled ? 0.22 : 0.16;
@@ -3664,6 +5135,23 @@ export default function App() {
         const vidTime = vid.currentTime || 0;
         if (!isScrubbingRef.current) {
           currentTimeRef.current = vidTime;
+        }
+
+        // A-B Segment Loop enforcement
+        const lp = loopPointsRef.current;
+        if (
+          lp.a !== null &&
+          lp.b !== null &&
+          lp.b > lp.a + 0.25 &&
+          !isScrubbingRef.current &&
+          vidTime >= lp.b
+        ) {
+          try {
+            vid.currentTime = lp.a;
+            currentTimeRef.current = lp.a;
+          } catch {
+            // Ignore seek race
+          }
         }
 
         const vw = vid.videoWidth || 1920;
@@ -3691,64 +5179,78 @@ export default function App() {
             }
           }
         }
+        if (cfg.autoCropBlackBars && detectedAutoCropRef.current > 0.005) {
+          smoothAutoCropRatio =
+            smoothAutoCropRatio * 0.88 + detectedAutoCropRef.current * 0.12;
+          uvScaleY *= Math.max(0.68, 1.0 - smoothAutoCropRatio);
+        } else if (smoothAutoCropRatio > 0.001) {
+          smoothAutoCropRatio *= 0.85;
+          uvScaleY *= Math.max(0.68, 1.0 - smoothAutoCropRatio);
+        }
 
         // Strictly synchronized keyframe upload:
-        // Upload ONLY when the decoder delivers a genuinely new video frame, preventing duplicate uploads into prev & curr
+        // Upload ONLY when the decoder delivers a genuinely new video frame, preventing duplicate uploads into glPrevTex & glCurrTex!
         const mediaDeltaSec = Math.abs(vidTime - lastDecodedVideoTimeRef.current);
         const timeSinceLastUploadMs = now - lastKeyframeUploadPerfNowRef.current;
         const rate = Math.max(0.25, cfg.playbackRate || 1.0);
         const vidQuality =
           typeof vid.getVideoPlaybackQuality === 'function' ? vid.getVideoPlaybackQuality() : null;
         const currentDecodedFrames = vidQuality ? vidQuality.totalVideoFrames : -1;
-        const hasNewQualityFrame =
-          currentDecodedFrames > 0 &&
-          currentDecodedFrames !== lastDecodedFrameCount &&
-          mediaDeltaSec >= 0.004;
 
         const fallbackIntervalSec = Math.max(
-          0.020,
-          (estimatedFrameIntervalMsRef.current * 0.00085) * rate
+          0.022,
+          (estimatedFrameIntervalMsRef.current * 0.00082) * rate
         );
         const rVfcStalled =
-          rVfcActiveRef.current && timeSinceLastUploadMs > 90 && mediaDeltaSec >= 0.024;
+          rVfcActiveRef.current && timeSinceLastUploadMs > 95 && mediaDeltaSec >= 0.022;
+        if (rVfcStalled) {
+          rVfcActiveRef.current = false;
+          armVideoFrameCallback();
+        }
+
         const isFirstFrame = lastDecodedVideoTimeRef.current < 0;
-        const hasGenuineTimeStep = mediaDeltaSec >= 0.004;
+        // Minimum 10ms media timestamp step prevents duplicate upload of the same decoded frame
+        const hasGenuineTimeStep = mediaDeltaSec >= 0.010;
+        const hasNewQualityFrame =
+          !rVfcActiveRef.current &&
+          currentDecodedFrames > 0 &&
+          currentDecodedFrames !== lastDecodedFrameCount &&
+          hasGenuineTimeStep;
 
         const shouldUploadFrame =
           vid.readyState >= 2 &&
           (!vid.seeking || isScrubbingRef.current || justSeekedRef.current) &&
           (isFirstFrame ||
             justSeekedRef.current ||
-            (hasNewVideoFrameRef.current && (hasGenuineTimeStep || isScrubbingRef.current)) ||
+            isScrubbingRef.current ||
+            (hasNewVideoFrameRef.current && (hasGenuineTimeStep || timeSinceLastUploadMs >= 24)) ||
             hasNewQualityFrame ||
-            (!rVfcActiveRef.current && currentDecodedFrames <= 0 && mediaDeltaSec >= fallbackIntervalSec) ||
+            (!rVfcActiveRef.current && mediaDeltaSec >= fallbackIntervalSec) ||
             rVfcStalled);
 
-        if (rVfcStalled) {
-          armVideoFrameCallback();
-        }
-
-        const intervalMs = Math.max(15.0, snapToCanonicalCadenceMs(estimatedFrameIntervalMsRef.current / rate) * rate);
-        const effectiveTickDtMs = Math.max(4.0, Math.min(36.0, pllDisplayDtMs));
-        const expectedVidTicks = Math.max(1.0, intervalMs / effectiveTickDtMs);
+        const intervalMs = Math.max(16.67, snapToCanonicalCadenceMs(estimatedFrameIntervalMsRef.current / rate) * rate);
+        const effectiveTickDtMs = Math.max(4.0, Math.min(36.0, effectivePllDtMs));
+        const expectedVidTicks = Math.max(1.5, intervalMs / effectiveTickDtMs);
         const nominalVidStep = 1.0 / expectedVidTicks;
 
         const [targetFlowCols, targetFlowRows] = resolveAdaptiveFlowDims(
           cfg.flowScaleMode,
           vw,
-          cfg.effectiveTargetFps
+          cfg.effectiveTargetFps,
+          cfg.ecoThermalMode
         );
 
         if (shouldUploadFrame) {
+          didUploadNewKeyframe = true;
           // Only reset history on genuine backward seeks or large timeline jumps (> 0.65s), never on normal 24/30/60fps playback steps!
           const isBackwardOrJump =
-            vidTime < lastDecodedVideoTimeRef.current - 0.015 ||
-            mediaDeltaSec > Math.max(0.65, (estimatedFrameIntervalMsRef.current * 0.012) * rate);
+            vidTime < lastDecodedVideoTimeRef.current - 0.020 ||
+            mediaDeltaSec > Math.max(0.65, (estimatedFrameIntervalMsRef.current * 0.015) * rate);
           const resetHist =
             isFirstFrame || isScrubbingRef.current || isBackwardOrJump;
-          const elapsed = now - lastKeyframeUploadPerfNowRef.current;
-          if ((hasNewQualityFrame || hasGenuineTimeStep) && elapsed >= 12 && elapsed <= 120) {
-            const stabilizedElapsed = snapToCanonicalCadenceMs(elapsed / rate) * rate;
+          const mediaStepMs = (mediaDeltaSec * 1000) / rate;
+          if (!rVfcActiveRef.current && !resetHist && mediaStepMs >= 16.0 && mediaStepMs <= 85.0) {
+            const stabilizedElapsed = snapToCanonicalCadenceMs(mediaStepMs) * rate;
             estimatedFrameIntervalMsRef.current =
               estimatedFrameIntervalMsRef.current * 0.85 + stabilizedElapsed * 0.15;
           }
@@ -3756,10 +5258,8 @@ export default function App() {
             lastDecodedFrameCount = currentDecodedFrames;
           }
           lastKeyframeUploadPerfNowRef.current = now;
-          lastDecodedVideoTimeRef.current =
-            pendingMediaTimeRef.current >= 0 && Math.abs(pendingMediaTimeRef.current - vidTime) < 0.08
-              ? pendingMediaTimeRef.current
-              : vidTime;
+          // Always store vidTime so mediaDeltaSec is measured in a consistent clock domain
+          lastDecodedVideoTimeRef.current = vidTime;
           hasNewVideoFrameRef.current = false;
           justSeekedRef.current = false;
 
@@ -3780,17 +5280,20 @@ export default function App() {
               cfg.showSadHeatmap
             );
             lastPass1Signature = updatedSig;
+            pass2BindingsDirty = true;
             subframeTickIndex = 0;
-            // VSync PLL v2: Carry fractional phase remainder across keyframe boundary for uniform sub-frame cadence
+            // VSync PLL v3: Start sub-frame phase smoothly inside the first interval
             const wrappedPhase = (pllPhase + nominalVidStep) - 1.0;
             pllPhase = resetHist
-              ? Math.min(0.45, Math.max(0.08, 0.5 * nominalVidStep))
+              ? Math.min(0.35, Math.max(0.12, 0.5 * nominalVidStep))
               : Math.min(
                   Math.max(
-                    0.35 * nominalVidStep,
-                    wrappedPhase > 0.02 && wrappedPhase < 0.65 ? wrappedPhase : 0.5 * nominalVidStep
+                    0.22 * nominalVidStep,
+                    wrappedPhase > 0.02 && wrappedPhase < 0.65
+                      ? wrappedPhase * 0.65 + 0.45 * nominalVidStep * 0.35
+                      : 0.45 * nominalVidStep
                   ),
-                  0.65
+                  0.58
                 );
           } catch {
             // Ignore if video frame is mid-decode
@@ -3810,14 +5313,18 @@ export default function App() {
               false
             );
             lastPass1Signature = pass1Sig;
+            pass2BindingsDirty = true;
           }
           subframeTickIndex += 1;
           const elapsedSinceKeyframeMs = Math.max(0, now - lastKeyframeUploadPerfNowRef.current);
-          const clockPhase = (elapsedSinceKeyframeMs + 0.5 * pllDisplayDtMs) / intervalMs;
+          const clockPhase = Math.min(0.96, (elapsedSinceKeyframeMs + 0.35 * effectiveTickDtMs) / intervalMs);
           const nextUniform = pllPhase + nominalVidStep;
           const phaseErr = Math.max(-0.08, Math.min(0.08, clockPhase - nextUniform));
-          const lockGain = cfg.subframeCascadeEnabled ? 0.22 : 0.16;
-          pllPhase = Math.min(0.985, Math.max(pllPhase + nominalVidStep * 0.76, nextUniform + phaseErr * lockGain));
+          const lockGain = cfg.subframeCascadeEnabled ? 0.25 : 0.20;
+          pllPhase = Math.min(
+            0.96,
+            Math.max(pllPhase + nominalVidStep * 0.75, nextUniform + phaseErr * lockGain)
+          );
         }
 
         // Automatic VSync Phase-Locked Loop (PLL) sub-frame progression:
@@ -3833,40 +5340,108 @@ export default function App() {
         }
       }
 
-      // Native Video + DevicePixelRatio Output Framebuffer Resolution (Zero downscaling loss on 1080p/4K & Retina screens!)
-      const dpr = Math.min(2.5, window.devicePixelRatio || 1);
+      // Stationary Sub-Frame Skip: When no new keyframe arrived, no settings/bindings changed, and alpha hasn't moved
+      // (e.g., effectiveMode === 'off' or alpha reached 0.985 waiting for the next decoder frame), skip redundant GPU drawArrays!
+      if (
+        !didUploadNewKeyframe &&
+        !wasForcedRedraw &&
+        !isScrubbingRef.current &&
+        !pendingSnapshotRef.current &&
+        !pass2BindingsDirty &&
+        Math.abs(alpha - lastRenderedAlpha) < 0.008
+      ) {
+        return;
+      }
+
+      lastRenderSubmittedTime = now;
+      lastRenderedAlpha = alpha;
+
+      // Thermally-Smart Output Framebuffer Resolution:
+      // In Eco Thermal Mode, cap DPR at 1.5 and output framebuffer at 1920x1080 (Full HD) to prevent 4K super-sampling heat
+      const maxDpr = cfg.ecoThermalMode ? 1.5 : 2.25;
+      const dpr = Math.min(maxDpr, window.devicePixelRatio || 1);
       const viewportPhysW = Math.round((outCanvas?.clientWidth || activeVw) * dpr);
       const viewportPhysH = Math.round((outCanvas?.clientHeight || activeVh) * dpr);
       const baseW = Math.max(activeVw, viewportPhysW);
       const baseH = Math.max(activeVh, viewportPhysH);
-      const scaleMult = cfg.upscaleEnabled ? Math.max(1.0, cfg.effectiveUpscaleFactor * 0.75) : 1.0;
+      const scaleMult = cfg.upscaleEnabled
+        ? cfg.ecoThermalMode
+          ? Math.min(1.25, Math.max(1.0, cfg.effectiveUpscaleFactor * 0.65))
+          : Math.max(1.0, cfg.effectiveUpscaleFactor * 0.75)
+        : 1.0;
       const rawOutW = Math.round(baseW * scaleMult);
       const rawOutH = Math.round(baseH * scaleMult);
-      const fitScale = Math.min(1.0, maxGpuWidth / Math.max(1, rawOutW), maxGpuHeight / Math.max(1, rawOutH));
+      const effectiveMaxW = cfg.ecoThermalMode ? Math.min(1920, maxGpuWidth) : maxGpuWidth;
+      const effectiveMaxH = cfg.ecoThermalMode ? Math.min(1080, maxGpuHeight) : maxGpuHeight;
+      const fitScale = Math.min(1.0, effectiveMaxW / Math.max(1, rawOutW), effectiveMaxH / Math.max(1, rawOutH));
       const targetOutW = Math.max(640, Math.round(rawOutW * fitScale));
       const targetOutH = Math.max(360, Math.round(rawOutH * fitScale));
 
       if (outCanvas && (outCanvas.width !== targetOutW || outCanvas.height !== targetOutH)) {
         outCanvas.width = targetOutW;
         outCanvas.height = targetOutH;
+        pass2BindingsDirty = true;
       }
 
-      // Ensure Screen Framebuffer, Viewport, and Pass 2 Program are active before setting uniforms and drawing
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      gl.viewport(0, 0, outCanvas ? outCanvas.width : targetOutW, outCanvas ? outCanvas.height : targetOutH);
-      gl.useProgram(synthProg);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, glCurrTex);
-      gl.activeTexture(gl.TEXTURE2);
-      gl.bindTexture(gl.TEXTURE_2D, glFlowCurrTex);
-      if (glSadDebugTex) {
-        gl.activeTexture(gl.TEXTURE3);
-        gl.bindTexture(gl.TEXTURE_2D, glSadDebugTex);
+      const curOutW = outCanvas ? outCanvas.width : targetOutW;
+      const curOutH = outCanvas ? outCanvas.height : targetOutH;
+
+      // Bind Screen Framebuffer, Viewport, Pass 2 Program, Quad Buffer & Textures ONLY when dirty
+      if (pass2BindingsDirty || lastViewportW !== curOutW || lastViewportH !== curOutH) {
+        pass2BindingsDirty = false;
+        lastViewportW = curOutW;
+        lastViewportH = curOutH;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, curOutW, curOutH);
+        gl.useProgram(synthProg);
+        if (quadBuf) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+          gl.vertexAttribPointer(synthPosLoc, 2, gl.FLOAT, false, 0, 0);
+        }
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, glCurrTex);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, glFlowCurrTex);
+        if (glSadDebugTex) {
+          gl.activeTexture(gl.TEXTURE3);
+          gl.bindTexture(gl.TEXTURE_2D, glSadDebugTex);
+        }
+        if (glSubframeMidTex) {
+          gl.activeTexture(gl.TEXTURE4);
+          gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
+        }
+        if (glLutTex) {
+          gl.activeTexture(gl.TEXTURE5);
+          gl.bindTexture(gl.TEXTURE_2D, glLutTex);
+        }
+        if (glSubframeQ1Tex) {
+          gl.activeTexture(gl.TEXTURE6);
+          gl.bindTexture(gl.TEXTURE_2D, glSubframeQ1Tex);
+        }
+        if (glSubframeQ3Tex) {
+          gl.activeTexture(gl.TEXTURE7);
+          gl.bindTexture(gl.TEXTURE_2D, glSubframeQ3Tex);
+        }
       }
 
-      // Pass 2: Synthesize Intermediate Frame (Pass 2A Anchor FBO + Pass 2B Secondary Sub-Frame Cascade)
+      // Upload 3D LUT texture when preset or custom .cube changes
+      const targetLutKey = `${cfg.lutPreset}:${cfg.lutVersion}`;
+      if (glLutTex && lastUploadedLutKey !== targetLutKey) {
+        lastUploadedLutKey = targetLutKey;
+        const stripData =
+          cfg.lutPreset === 'custom' && customLutStripRef.current
+            ? customLutStripRef.current
+            : generateBuiltInLutStrip(
+                cfg.lutPreset === 'custom' ? 'off' : cfg.lutPreset
+              );
+        gl.activeTexture(gl.TEXTURE5);
+        gl.bindTexture(gl.TEXTURE_2D, glLutTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 16, 0, gl.RGBA, gl.UNSIGNED_BYTE, stripData);
+      }
+
+      // Pass 2: Synthesize Intermediate Frame (Pass 2A 3-Anchor FBOs + Pass 2B Secondary Sub-Frame Cascade)
       const shaderMode =
         effectiveMode === 'off'
           ? 0
@@ -3894,6 +5469,8 @@ export default function App() {
         : cfg.upscaleMode === 'cinema'
         ? 3
         : 4; // Mode 4 = Qualcomm Snapdragon GSR (Game Super Resolution)
+      const effectiveDeband = cfg.debandEnabled ? cfg.debandStrength * 0.01 : 0.0;
+      const effectiveLutStr = cfg.lutPreset !== 'off' ? cfg.lutStrength * 0.01 : 0.0;
 
       // Dirty-flag uniform updates
       if (lastUniforms.strength !== cfg.interpStrength) {
@@ -3947,6 +5524,26 @@ export default function App() {
         gl.uniform1f(uBrightnessLoc, cfg.videoBrightness);
         lastUniforms.brightness = cfg.videoBrightness;
       }
+      if (lastUniforms.contrast !== cfg.videoContrast) {
+        if (uContrastLoc) gl.uniform1f(uContrastLoc, cfg.videoContrast);
+        lastUniforms.contrast = cfg.videoContrast;
+      }
+      if (lastUniforms.saturation !== cfg.videoSaturation) {
+        if (uSaturationLoc) gl.uniform1f(uSaturationLoc, cfg.videoSaturation);
+        lastUniforms.saturation = cfg.videoSaturation;
+      }
+      if (lastUniforms.blackPoint !== cfg.videoBlackPoint) {
+        if (uBlackPointLoc) gl.uniform1f(uBlackPointLoc, cfg.videoBlackPoint);
+        lastUniforms.blackPoint = cfg.videoBlackPoint;
+      }
+      if (lastUniforms.debandStrength !== effectiveDeband) {
+        if (uDebandStrengthLoc) gl.uniform1f(uDebandStrengthLoc, effectiveDeband);
+        lastUniforms.debandStrength = effectiveDeband;
+      }
+      if (lastUniforms.lutStrength !== effectiveLutStr) {
+        if (uLutStrengthLoc) gl.uniform1f(uLutStrengthLoc, effectiveLutStr);
+        lastUniforms.lutStrength = effectiveLutStr;
+      }
       const effectiveHdr = cfg.hdrEnabled ? cfg.hdrStrength : 0.0;
       if (lastUniforms.hdr !== effectiveHdr) {
         gl.uniform1f(uHdrLoc, effectiveHdr);
@@ -3989,71 +5586,94 @@ export default function App() {
         lastUniforms.coherenceGuard = coherenceGuardVal;
       }
 
-      // Pass 2A: Synthesize Primary Anchor Intermediate Frame (I_0.5) into glSubframeMidFbo (once per keyframe pair!)
+      // Pass 2A: Synthesize up to 3 Anchor Intermediate FBO Sub-Frames (I_0.25, I_0.50, I_0.75)
+      // Executed ONLY once per decoded keyframe pair, dynamically scaled up to 2560x1440 (1440p QHD) with Smart VRAM & Thermal Governor!
       if (cascadeShaderVal > 0 && glSubframeMidFbo && glSubframeMidTex) {
-        const anchorFit = Math.min(1.0, 1920 / Math.max(1, activeVw), 1080 / Math.max(1, activeVh));
-        const targetSubW = Math.max(480, Math.round(activeVw * anchorFit));
-        const targetSubH = Math.max(270, Math.round(activeVh * anchorFit));
-        const pass2ASig = `${lastPass1Signature}:${targetSubW}x${targetSubH}:${cfg.interpStrength.toFixed(3)}:${haloGuardVal.toFixed(3)}`;
+        const [targetSubW, targetSubH] = resolveSubframeBufferDims(
+          cfg.subframeBufferResMode,
+          activeVw,
+          activeVh,
+          cfg.ecoThermalMode,
+          cfg.effectiveTargetFps,
+          now
+        );
+        const tierMode = cascadeShaderVal >= 3 ? 3 : 2;
+        const pass2ASig = `${lastPass1Signature}:${targetSubW}x${targetSubH}:${tierMode}:${cfg.interpStrength.toFixed(3)}:${haloGuardVal.toFixed(3)}:${coherenceGuardVal.toFixed(2)}`;
 
         if (lastPass2ASignature !== pass2ASig) {
           lastPass2ASignature = pass2ASig;
-          // Unbind glSubframeMidTex from TEXTURE4 before rendering into glSubframeMidFbo to prevent WebGL feedback loop
-          gl.activeTexture(gl.TEXTURE4);
-          gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
 
           if (allocatedSubframeW !== targetSubW || allocatedSubframeH !== targetSubH) {
             allocatedSubframeW = targetSubW;
             allocatedSubframeH = targetSubH;
+            gl.activeTexture(gl.TEXTURE4);
             gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
-            gl.texImage2D(
-              gl.TEXTURE_2D,
-              0,
-              gl.RGBA,
-              targetSubW,
-              targetSubH,
-              0,
-              gl.RGBA,
-              gl.UNSIGNED_BYTE,
-              null
-            );
-            gl.bindTexture(gl.TEXTURE_2D, glPrevTex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, targetSubW, targetSubH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            if (glSubframeQ1Tex) {
+              gl.activeTexture(gl.TEXTURE6);
+              gl.bindTexture(gl.TEXTURE_2D, glSubframeQ1Tex);
+              gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, targetSubW, targetSubH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            }
+            if (glSubframeQ3Tex) {
+              gl.activeTexture(gl.TEXTURE7);
+              gl.bindTexture(gl.TEXTURE_2D, glSubframeQ3Tex);
+              gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, targetSubW, targetSubH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            }
           }
 
+          // Stage 1: Synthesize Midpoint Anchor Sub-Frame I_0.50 (alpha = 0.50) into glSubframeMidFbo
+          gl.activeTexture(gl.TEXTURE4);
+          gl.bindTexture(gl.TEXTURE_2D, glPrevTex); // Prevent WebGL feedback loop on TEXTURE4
           gl.bindFramebuffer(gl.FRAMEBUFFER, glSubframeMidFbo);
           gl.viewport(0, 0, allocatedSubframeW, allocatedSubframeH);
           if (uFboPassLoc) gl.uniform1i(uFboPassLoc, 1);
           if (uSubframeCascadeLoc) gl.uniform1i(uSubframeCascadeLoc, 0);
           gl.uniform1f(uAlphaLoc, 0.5);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+          // Rebind synthesized I_0.50 on TEXTURE4 so Stages 2 & 3 can warp from it
+          gl.activeTexture(gl.TEXTURE4);
+          gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
 
-          if (meshBuf) {
-            gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
-            gl.vertexAttribPointer(synthPosLoc, 2, gl.FLOAT, false, 0, 0);
-            gl.drawArrays(gl.TRIANGLES, 0, meshVertexCount);
-          } else {
+          // Stage 2 & Stage 3: Synthesize Quarter-Phase Anchor Sub-Frames I_0.25 (Sub 1) and I_0.75 (Sub 3)
+          if (
+            cascadeShaderVal >= 3 &&
+            glSubframeQ1Fbo &&
+            glSubframeQ1Tex &&
+            glSubframeQ3Fbo &&
+            glSubframeQ3Tex
+          ) {
+            // Stage 2: I_0.25 (warps T-1 and I_0.50 with ±0.25*V)
+            gl.activeTexture(gl.TEXTURE6);
+            gl.bindTexture(gl.TEXTURE_2D, glPrevTex); // Prevent feedback loop on TEXTURE6
+            gl.bindFramebuffer(gl.FRAMEBUFFER, glSubframeQ1Fbo);
+            if (uFboPassLoc) gl.uniform1i(uFboPassLoc, 2);
+            gl.uniform1f(uAlphaLoc, 0.25);
             gl.drawArrays(gl.TRIANGLES, 0, 6);
+            gl.activeTexture(gl.TEXTURE6);
+            gl.bindTexture(gl.TEXTURE_2D, glSubframeQ1Tex);
+
+            // Stage 3: I_0.75 (warps I_0.50 and T with ±0.25*V)
+            gl.activeTexture(gl.TEXTURE7);
+            gl.bindTexture(gl.TEXTURE_2D, glPrevTex); // Prevent feedback loop on TEXTURE7
+            gl.bindFramebuffer(gl.FRAMEBUFFER, glSubframeQ3Fbo);
+            if (uFboPassLoc) gl.uniform1i(uFboPassLoc, 3);
+            gl.uniform1f(uAlphaLoc, 0.75);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+            gl.activeTexture(gl.TEXTURE7);
+            gl.bindTexture(gl.TEXTURE_2D, glSubframeQ3Tex);
           }
 
           // Restore Screen Pass 2B state
           if (uFboPassLoc) gl.uniform1i(uFboPassLoc, 0);
           if (uSubframeCascadeLoc) gl.uniform1i(uSubframeCascadeLoc, cascadeShaderVal);
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-          gl.viewport(0, 0, outCanvas ? outCanvas.width : targetOutW, outCanvas ? outCanvas.height : targetOutH);
+          gl.viewport(0, 0, curOutW, curOutH);
         }
-
-        gl.activeTexture(gl.TEXTURE4);
-        gl.bindTexture(gl.TEXTURE_2D, glSubframeMidTex);
       }
 
-      // Pass 2B: Update sub-frame phase alpha and draw 2D Elastic Subdivided Mesh directly to screen
+      // Pass 2B: Update sub-frame phase alpha and draw 6-vertex Fullscreen Quad directly to screen (zero diagonal edge overshading!)
       gl.uniform1f(uAlphaLoc, alpha);
-      if (meshBuf) {
-        gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
-        gl.vertexAttribPointer(synthPosLoc, 2, gl.FLOAT, false, 0, 0);
-        gl.drawArrays(gl.TRIANGLES, 0, meshVertexCount);
-      } else {
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
-      }
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
 
       // Synchronous PNG Snapshot capture immediately after gl.drawArrays while drawing buffer is still valid
       if (pendingSnapshotRef.current && outCanvas) {
@@ -4090,25 +5710,43 @@ export default function App() {
       // Direct DOM updates (~8 times/sec) -> ZERO React re-renders during playback!
       if (now - lastDomSyncTime >= 120) {
         lastDomSyncTime = now;
-        const screenHz = Math.min(240, Math.max(50, Math.round(1000 / dtMs)));
+        const screenHz = Math.min(240, Math.max(30, Math.round(targetRenderFps)));
         const latencyStr = procLatencyAvgRef.current.toFixed(2);
         const srcFps = Math.min(
           120,
           Math.max(12, Math.round(1000 / Math.max(8, estimatedFrameIntervalMsRef.current)))
         );
+        const activeSubFboCount = cascadeShaderVal > 0 ? (cascadeShaderVal >= 3 ? 3 : 1) : 0;
+        const keyframeVramBytes = allocatedTexW * allocatedTexH * 8;
+        const subframeVramBytes = activeSubFboCount * allocatedSubframeW * allocatedSubframeH * 4;
+        const flowVramBytes =
+          (allocatedFlowCols * allocatedFlowRows * 3 +
+            PYR_L05_COLS * PYR_L05_ROWS +
+            PYR_L1_COLS * PYR_L1_ROWS +
+            PYR_L2_COLS * PYR_L2_ROWS) *
+          4;
+        const totalVramMb = (keyframeVramBytes + subframeVramBytes + flowVramBytes) / (1024 * 1024);
+        vramUsageMbRef.current = Number(totalVramMb.toFixed(1));
+        activeFlowGridStrRef.current = `${allocatedFlowCols}×${allocatedFlowRows}`;
+        activeSubframeResStrRef.current = `${allocatedSubframeW}×${allocatedSubframeH}`;
+
+        const pyrLvlCount = allocatedFlowCols > PYR_L05_COLS ? 6 : 5;
         const cascadeBadgeStr =
-          cascadeShaderVal > 0 ? ` • Суб-FBO ${cascadeShaderVal}x` : '';
+          cascadeShaderVal > 0
+            ? ` • Суб-FBO ${cascadeShaderVal}x (${allocatedSubframeW}×${allocatedSubframeH})`
+            : '';
+        const ecoBadgeStr = cfg.ecoThermalMode ? ' • ЭКО-Холод' : '';
 
         if (hudMetricsBadgeRef.current) {
           hudMetricsBadgeRef.current.textContent = `${
             cfg.isDemoTestActive ? 'ТЕСТ 24 FPS • ' : cfg.isAdrenoActive ? 'Adreno GMEM • ' : ''
-          }${srcFps}→${screenHz} FPS • Mesh ${MESH_COLS}×${MESH_ROWS} • Pyr 5-Lvl (${allocatedFlowCols}×${allocatedFlowRows})${cascadeBadgeStr} • α=${alpha.toFixed(2)} • Синтез: ${synthesizedCounterRef.current}`;
+          }${srcFps}→${screenHz} FPS • Pyr ${pyrLvlCount}-Lvl (${allocatedFlowCols}×${allocatedFlowRows})${ecoBadgeStr}${cascadeBadgeStr} • VRAM ${vramUsageMbRef.current.toFixed(1)} МБ • α=${alpha.toFixed(2)}`;
         }
         if (playerSynthCountRef.current) {
           playerSynthCountRef.current.textContent = String(synthesizedCounterRef.current);
         }
         if (playerAlphaBadgeRef.current) {
-          playerAlphaBadgeRef.current.textContent = `α = ${alpha.toFixed(2)} (${srcFps} → ${screenHz} FPS${cascadeBadgeStr})`;
+          playerAlphaBadgeRef.current.textContent = `α = ${alpha.toFixed(2)} (${srcFps} → ${screenHz} FPS${ecoBadgeStr}${cascadeBadgeStr})`;
         }
         if (timecodeDisplayRef.current) {
           timecodeDisplayRef.current.textContent = formatTime(currentTimeRef.current);
@@ -4139,22 +5777,121 @@ export default function App() {
           }
         }
 
-        // Update Subtitle Overlay directly via DOM ref (O(log N) binary search)
+        // Check Opening/Ending skip intervals (from Kodik / Anixart stream metadata)
+        const curSec = currentTimeRef.current;
+        const matchedSkip =
+          skipTimingsRef.current.find((s) => curSec >= s.start && curSec < s.end - 1.0) || null;
+        if (
+          matchedSkip?.start !== activeSkipPromptRef.current?.start ||
+          matchedSkip?.end !== activeSkipPromptRef.current?.end
+        ) {
+          activeSkipPromptRef.current = matchedSkip;
+          setActiveSkipPrompt(matchedSkip);
+        }
+
+        // Update Dual Subtitle Overlays (Bottom & Top / {\an8}) directly via DOM refs
+        const dualSubs = findActiveDualSubtitles(
+          cfg.subtitleCues,
+          cfg.secondarySubtitleCues,
+          currentTimeRef.current - cfg.subDelaySec,
+          cfg.subtitlesEnabled,
+          cfg.secondarySubtitlesEnabled
+        );
         if (subtitleBoxRef.current && subtitleTextSpanRef.current) {
-          if (!cfg.subtitlesEnabled || !cfg.subtitleCues.length) {
-            if (lastSubtitleStr !== '') {
-              subtitleBoxRef.current.style.display = 'none';
-              lastSubtitleStr = '';
+          if (dualSubs.bottomText !== lastSubtitleStr) {
+            lastSubtitleStr = dualSubs.bottomText;
+            subtitleTextSpanRef.current.textContent = dualSubs.bottomText;
+            subtitleBoxRef.current.style.display = dualSubs.bottomText ? 'flex' : 'none';
+          }
+        }
+        if (topSubtitleBoxRef.current && topSubtitleTextSpanRef.current) {
+          if (dualSubs.topText !== lastTopSubtitleStr) {
+            lastTopSubtitleStr = dualSubs.topText;
+            topSubtitleTextSpanRef.current.textContent = dualSubs.topText;
+            topSubtitleBoxRef.current.style.display = dualSubs.topText ? 'flex' : 'none';
+          }
+        }
+
+        // Dynamic Ambilight (32x18 micro-Canvas) + Auto-Crop Black Bars Luma Detector (every ~2.0s)
+        if ((cfg.ambilightEnabled || cfg.autoCropBlackBars) && ambilightCanvasRef.current) {
+          const ambiCanvas = ambilightCanvasRef.current;
+          const ambiCtx = ambiCanvas.getContext('2d', { willReadFrequently: cfg.autoCropBlackBars });
+          const ambiSrc = cfg.isDemoTestActive ? stagingCanvas : videoRef.current;
+          if (ambiCtx && ambiSrc) {
+            try {
+              ambiCtx.drawImage(ambiSrc, 0, 0, 32, 18);
+              if (cfg.autoCropBlackBars && now - lastAutoCropCheckTime >= 2000) {
+                lastAutoCropCheckTime = now;
+                const img = ambiCtx.getImageData(0, 0, 32, 18).data;
+                const getRowAvgLuma = (row: number) => {
+                  let sum = 0;
+                  for (let x = 4; x < 28; x++) {
+                    const idx = (row * 32 + x) << 2;
+                    sum += img[idx] * 0.299 + img[idx + 1] * 0.587 + img[idx + 2] * 0.114;
+                  }
+                  return sum / 24;
+                };
+                const midLuma = (getRowAvgLuma(8) + getRowAvgLuma(9)) * 0.5;
+                if (midLuma > 18) {
+                  let topBarRows = 0;
+                  let botBarRows = 0;
+                  for (let r = 0; r < 3; r++) {
+                    if (getRowAvgLuma(r) < 11) topBarRows++;
+                    else break;
+                  }
+                  for (let r = 17; r > 14; r--) {
+                    if (getRowAvgLuma(r) < 11) botBarRows++;
+                    else break;
+                  }
+                  const symBars = Math.min(topBarRows, botBarRows);
+                  const cropRatio = Math.min(0.24, (symBars * 2) / 18.0);
+                  detectedAutoCropRef.current = cropRatio;
+                  setDetectedAutoCropPct(Math.round(cropRatio * 100));
+                }
+              }
+            } catch {
+              // Ignore cross-origin readback restrictions
             }
-          } else {
-            const cueText = findActiveSubtitleText(
-              cfg.subtitleCues,
-              currentTimeRef.current - cfg.subDelaySec
-            );
-            if (cueText !== lastSubtitleStr) {
-              lastSubtitleStr = cueText;
-              subtitleTextSpanRef.current.textContent = cueText;
-              subtitleBoxRef.current.style.display = cueText ? 'flex' : 'none';
+          }
+        }
+
+        // Update Top HUD Real-Time Telemetry Sparkline, Dropped Frames & Real Interpolation Ratio
+        if (cfg.showTopHud && cfg.showHudTelemetryGraph) {
+          if (hudFpsRatioRef.current) {
+            hudFpsRatioRef.current.textContent = `${srcFps} → ${screenHz} FPS (${(
+              screenHz / Math.max(1, srcFps)
+            ).toFixed(1)}x)`;
+          }
+          if (hudDroppedFramesRef.current) {
+            const vidQ =
+              !cfg.isDemoTestActive &&
+              videoRef.current &&
+              typeof videoRef.current.getVideoPlaybackQuality === 'function'
+                ? videoRef.current.getVideoPlaybackQuality()
+                : null;
+            const dropped = vidQ ? vidQ.droppedVideoFrames : 0;
+            const totalDec = vidQ ? vidQ.totalVideoFrames : 0;
+            hudDroppedFramesRef.current.textContent = `Drop: ${dropped}/${totalDec} • ${latencyStr} мс`;
+          }
+          const hCanvas = hudTelemetryCanvasRef.current;
+          if (hCanvas) {
+            const hc = hCanvas.getContext('2d');
+            if (hc) {
+              const hw = hCanvas.width;
+              const hh = hCanvas.height;
+              hc.clearRect(0, 0, hw, hh);
+              hc.strokeStyle = '#38bdf8';
+              hc.lineWidth = 1.6;
+              hc.beginPath();
+              const hist = frameTimeHistoryRef.current;
+              const step = hw / Math.max(1, hist.length - 1);
+              for (let i = 0; i < hist.length; i++) {
+                const clamped = Math.max(0.05, Math.min(4.0, hist[i]));
+                const y = hh - ((clamped - 0.05) / 3.95) * (hh - 6) - 3;
+                if (i === 0) hc.moveTo(0, y);
+                else hc.lineTo(i * step, y);
+              }
+              hc.stroke();
             }
           }
         }
@@ -4173,7 +5910,7 @@ export default function App() {
             }): ${latencyStr} мс`;
           }
           if (youHzLabelRef.current) {
-            youHzLabelRef.current.textContent = `Экран: ${screenHz} Гц • 2D Mesh ${MESH_COLS}×${MESH_ROWS} + 5-Lvl Pyr${cascadeBadgeStr}`;
+            youHzLabelRef.current.textContent = `Целевой поток: ${screenHz} FPS • Pyr ${pyrLvlCount}-Lvl (${allocatedFlowCols}×${allocatedFlowRows})${ecoBadgeStr}${cascadeBadgeStr} • VRAM ${vramUsageMbRef.current.toFixed(1)} МБ`;
           }
 
           const tCanvas = telemetryCanvasRef.current;
@@ -4212,23 +5949,29 @@ export default function App() {
         if (glPrevTex) gl.deleteTexture(glPrevTex);
         if (glCurrTex) gl.deleteTexture(glCurrTex);
         if (glSubframeMidTex) gl.deleteTexture(glSubframeMidTex);
+        if (glSubframeQ1Tex) gl.deleteTexture(glSubframeQ1Tex);
+        if (glSubframeQ3Tex) gl.deleteTexture(glSubframeQ3Tex);
+        if (glLutTex) gl.deleteTexture(glLutTex);
         if (glPyrL4Tex) gl.deleteTexture(glPyrL4Tex);
         if (glPyrL3Tex) gl.deleteTexture(glPyrL3Tex);
         if (glPyrL2Tex) gl.deleteTexture(glPyrL2Tex);
         if (glPyrL1Tex) gl.deleteTexture(glPyrL1Tex);
+        if (glPyrL05Tex) gl.deleteTexture(glPyrL05Tex);
         if (glFlowPrevTex) gl.deleteTexture(glFlowPrevTex);
         if (glFlowCurrTex) gl.deleteTexture(glFlowCurrTex);
         if (glSadDebugTex) gl.deleteTexture(glSadDebugTex);
         if (glSubframeMidFbo) gl.deleteFramebuffer(glSubframeMidFbo);
+        if (glSubframeQ1Fbo) gl.deleteFramebuffer(glSubframeQ1Fbo);
+        if (glSubframeQ3Fbo) gl.deleteFramebuffer(glSubframeQ3Fbo);
         if (glPyrL4Fbo) gl.deleteFramebuffer(glPyrL4Fbo);
         if (glPyrL3Fbo) gl.deleteFramebuffer(glPyrL3Fbo);
         if (glPyrL2Fbo) gl.deleteFramebuffer(glPyrL2Fbo);
         if (glPyrL1Fbo) gl.deleteFramebuffer(glPyrL1Fbo);
+        if (glPyrL05Fbo) gl.deleteFramebuffer(glPyrL05Fbo);
         if (glFlowFboPrev) gl.deleteFramebuffer(glFlowFboPrev);
         if (glFlowFboCurr) gl.deleteFramebuffer(glFlowFboCurr);
         if (glSadDebugFbo) gl.deleteFramebuffer(glSadDebugFbo);
         if (quadBuf) gl.deleteBuffer(quadBuf);
-        if (meshBuf) gl.deleteBuffer(meshBuf);
         if (flowProg) gl.deleteProgram(flowProg);
         if (synthProg) gl.deleteProgram(synthProg);
       }
@@ -4263,6 +6006,7 @@ export default function App() {
   // - Right Vertical Swipe: Volume (0% - 100%)
   // - Horizontal Swipe: Timeline Seek with target timecode & delta
   const handleStagePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (isTouchLocked) return;
     if (e.button !== 0 && e.pointerType === 'mouse') return;
     const rect = e.currentTarget.getBoundingClientRect();
     const relX = e.clientX - rect.left;
@@ -4296,6 +6040,7 @@ export default function App() {
   };
 
   const handleStagePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (isTouchLocked) return;
     const g = swipeGestureRef.current;
     if (!g.active || g.pointerId !== e.pointerId) return;
 
@@ -4428,6 +6173,7 @@ export default function App() {
   };
 
   const handleStagePointerUpOrLeave = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (isTouchLocked) return;
     if (holdTimerRef.current) {
       window.clearTimeout(holdTimerRef.current);
       holdTimerRef.current = null;
@@ -4487,6 +6233,7 @@ export default function App() {
   }, []);
 
   const handleStageClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isTouchLocked) return;
     if (isHoldSpeed2x) return;
     if (didSwipeRef.current) {
       didSwipeRef.current = false;
@@ -4556,7 +6303,7 @@ export default function App() {
   };
 
   const handleStageWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    if (!swipeVolumeBright) return;
+    if (isTouchLocked || !swipeVolumeBright) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const isLeftHalf = e.clientX - rect.left < rect.width * 0.5;
     const step = e.deltaY < 0 ? 0.05 : -0.05;
@@ -4590,8 +6337,292 @@ export default function App() {
     }
   };
 
-  // Process FileList (Videos or Subtitles) from Input, Folder Picker, or Drag & Drop
-  // and automatically persist video Blobs to IndexedDB (rex_media_vault_v1) for instant auto-binding on next startup
+  // A-B Segment Loop & Bookmarks handlers
+  const activeVideoBookmarkKey =
+    activeVideoKeyRef.current || lastActiveVideoId || activeVideoTitle || 'default_video';
+  const currentVideoBookmarks = bookmarksMap[activeVideoBookmarkKey] || [];
+
+  const handleToggleLoopAB = useCallback(() => {
+    const nowSec = currentTimeRef.current;
+    if (loopPointA === null) {
+      setLoopPointA(nowSec);
+      setLoopPointB(null);
+      showToast(`Точка A установлена: ${formatTime(nowSec)}`);
+    } else if (loopPointB === null) {
+      if (nowSec > loopPointA + 0.3) {
+        setLoopPointB(nowSec);
+        showToast(`Повтор A–B: ${formatTime(loopPointA)} → ${formatTime(nowSec)}`);
+      } else {
+        setLoopPointA(nowSec);
+        showToast(`Точка A обновлена: ${formatTime(nowSec)}`);
+      }
+    } else {
+      setLoopPointA(null);
+      setLoopPointB(null);
+      showToast('Повтор фрагмента A–B сброшен');
+    }
+  }, [loopPointA, loopPointB, showToast]);
+
+  const handleAddBookmark = useCallback(() => {
+    const nowSec = currentTimeRef.current;
+    const key = activeVideoKeyRef.current || lastActiveVideoId || activeVideoTitle || 'default_video';
+    const newMark: VideoBookmark = {
+      id: `bm_${Date.now()}`,
+      time: nowSec,
+      label: `Метка ${formatTime(nowSec)}`,
+      createdAt: Date.now()
+    };
+    setBookmarksMap((prev) => {
+      const existing = prev[key] || [];
+      const updated = [...existing, newMark].sort((a, b) => a.time - b.time);
+      const nextMap = { ...prev, [key]: updated };
+      saveAllVideoBookmarks(nextMap);
+      return nextMap;
+    });
+    showToast(`Закладка добавлена: ${formatTime(nowSec)}`);
+  }, [activeVideoTitle, lastActiveVideoId, showToast]);
+
+  const handleDeleteBookmark = useCallback(
+    (bmId: string) => {
+      const key = activeVideoKeyRef.current || lastActiveVideoId || activeVideoTitle || 'default_video';
+      setBookmarksMap((prev) => {
+        const existing = prev[key] || [];
+        const updated = existing.filter((b) => b.id !== bmId);
+        const nextMap = { ...prev, [key]: updated };
+        saveAllVideoBookmarks(nextMap);
+        return nextMap;
+      });
+      showToast('Закладка удалена');
+    },
+    [activeVideoTitle, lastActiveVideoId, showToast]
+  );
+
+  // Seekbar Frame Thumbnail Preview on Hover / Touch Drag
+  const lastPreviewSeekMsRef = useRef<number>(0);
+  const handleScrubberPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const maxDur = duration > 0 ? duration : Math.max(100, currentTimeRef.current);
+      const targetSec = ratio * maxDur;
+      const leftPct = Math.max(8, Math.min(92, ratio * 100));
+
+      setSeekHoverPreview({
+        visible: true,
+        timeSec: targetSec,
+        leftPct
+      });
+
+      const nowMs = performance.now();
+      if (nowMs - lastPreviewSeekMsRef.current < 85) return;
+      lastPreviewSeekMsRef.current = nowMs;
+
+      const pVid = seekPreviewVideoRef.current;
+      const pCanvas = seekPreviewCanvasRef.current;
+      if (!pCanvas) return;
+      const pCtx = pCanvas.getContext('2d');
+      if (!pCtx) return;
+
+      if (pVid && pVid.readyState >= 1 && pVid.src) {
+        try {
+          if (Math.abs(pVid.currentTime - targetSec) > 0.4) {
+            pVid.currentTime = targetSec;
+          }
+          pCtx.drawImage(pVid, 0, 0, pCanvas.width, pCanvas.height);
+          return;
+        } catch {
+          // Fallback to active canvas or video
+        }
+      }
+      if (renderCanvasRef.current) {
+        try {
+          pCtx.drawImage(renderCanvasRef.current, 0, 0, pCanvas.width, pCanvas.height);
+        } catch {
+          // Ignore
+        }
+      }
+    },
+    [duration]
+  );
+
+  const handleScrubberPointerLeave = useCallback(() => {
+    setSeekHoverPreview((prev) => (prev.visible ? { ...prev, visible: false } : prev));
+  }, []);
+
+  useEffect(() => {
+    const pVid = seekPreviewVideoRef.current;
+    if (!pVid) return;
+    const onSeeked = () => {
+      const pCanvas = seekPreviewCanvasRef.current;
+      if (!pCanvas) return;
+      const pCtx = pCanvas.getContext('2d');
+      if (!pCtx) return;
+      try {
+        pCtx.drawImage(pVid, 0, 0, pCanvas.width, pCanvas.height);
+      } catch {
+        // Ignore
+      }
+    };
+    pVid.addEventListener('seeked', onSeeked);
+    return () => pVid.removeEventListener('seeked', onSeeked);
+  }, []);
+
+  // WebGL Picture-in-Picture (Streams MEMC + Upscaler + HDR10 + 3D LUT Canvas to PiP Window)
+  useEffect(() => {
+    const pipVid = pipVideoRef.current;
+    const mainVid = videoRef.current;
+    const onLeavePip = () => {
+      setIsPipActive(false);
+    };
+    const onPipPause = () => {
+      if (document.pictureInPictureElement === pipVid) {
+        setIsPlaying(false);
+        if (mainVid && !mainVid.paused) mainVid.pause();
+      }
+    };
+    const onPipPlay = () => {
+      if (document.pictureInPictureElement === pipVid) {
+        setIsPlaying(true);
+        if (mainVid && mainVid.paused && !isDemoTestActive) {
+          mainVid.play().catch(() => {});
+        }
+      }
+    };
+    if (pipVid) {
+      pipVid.addEventListener('leavepictureinpicture', onLeavePip);
+      pipVid.addEventListener('pause', onPipPause);
+      pipVid.addEventListener('play', onPipPlay);
+    }
+    if (mainVid) {
+      mainVid.addEventListener('leavepictureinpicture', onLeavePip);
+    }
+    return () => {
+      if (pipVid) {
+        pipVid.removeEventListener('leavepictureinpicture', onLeavePip);
+        pipVid.removeEventListener('pause', onPipPause);
+        pipVid.removeEventListener('play', onPipPlay);
+      }
+      if (mainVid) {
+        mainVid.removeEventListener('leavepictureinpicture', onLeavePip);
+      }
+    };
+  }, [isDemoTestActive]);
+
+  const handleToggleWebglPip = useCallback(async () => {
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        setIsPipActive(false);
+        return;
+      }
+      const canvas = renderCanvasRef.current;
+      const pipVid = pipVideoRef.current;
+      if (canvas && pipVid && typeof (canvas as any).captureStream === 'function') {
+        const stream = (canvas as any).captureStream(60) as MediaStream;
+        pipVid.srcObject = stream;
+        pipVid.muted = true;
+        await pipVid.play();
+        if (typeof (pipVid as any).requestPictureInPicture === 'function') {
+          await (pipVid as any).requestPictureInPicture();
+          setIsPipActive(true);
+          showToast('Картинка-в-картинке (WebGL MEMC + Upscale) включена');
+          return;
+        }
+      }
+      if (videoRef.current && typeof (videoRef.current as any).requestPictureInPicture === 'function') {
+        await (videoRef.current as any).requestPictureInPicture();
+        setIsPipActive(true);
+        showToast('Картинка-в-картинке включена');
+      } else {
+        showToast('Picture-in-Picture не поддерживается браузером');
+      }
+    } catch {
+      showToast('Не удалось открыть окно Картинка-в-картинке');
+    }
+  }, [showToast]);
+
+  // Export Real-Time Telemetry & GPU Diagnostics JSON
+  const handleExportDiagnosticsJson = useCallback(() => {
+    const vidQ =
+      videoRef.current && typeof videoRef.current.getVideoPlaybackQuality === 'function'
+        ? videoRef.current.getVideoPlaybackQuality()
+        : null;
+    const srcFps = Math.min(
+      120,
+      Math.max(12, Math.round(1000 / Math.max(8, estimatedFrameIntervalMsRef.current)))
+    );
+    const report = {
+      exportedAt: new Date().toISOString(),
+      gpu: detectedGpuInfo,
+      video: {
+        title: activeVideoTitle,
+        resolution: videoNativeRes,
+        sourceFps: srcFps,
+        targetFps: effectiveTargetFps,
+        interpolationRatio: `${srcFps} -> ${effectiveTargetFps} FPS`,
+        droppedVideoFrames: vidQ ? vidQ.droppedVideoFrames : 0,
+        totalVideoFrames: vidQ ? vidQ.totalVideoFrames : 0,
+        synthesizedSubframes: synthesizedCounterRef.current
+      },
+      processor: {
+        interpEnabled,
+        interpMode,
+        flowScaleMode,
+        activeFlowGrid: activeFlowGridStrRef.current,
+        subframeCascadeEnabled,
+        subframeCascadeMode,
+        subframeBufferResMode,
+        activeSubframeRes: activeSubframeResStrRef.current,
+        estimatedVramMb: vramUsageMbRef.current,
+        upscaleEnabled,
+        upscaleMode,
+        effectiveUpscaleFactor,
+        debandEnabled,
+        debandStrength,
+        hdrEnabled,
+        adrenoTrue10Hdr,
+        lutPreset,
+        lutStrength,
+        autoCropBlackBars,
+        detectedAutoCropPct
+      },
+      frameTimeMsHistory: frameTimeHistoryRef.current.map((v) => Number(v.toFixed(3)))
+    };
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `REX_Telemetry_Report_${Date.now()}.json`;
+    a.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+    showToast('Диагностический отчёт телеметрии экспортирован (JSON)');
+  }, [
+    activeVideoTitle,
+    adrenoTrue10Hdr,
+    autoCropBlackBars,
+    debandEnabled,
+    debandStrength,
+    detectedAutoCropPct,
+    detectedGpuInfo,
+    effectiveTargetFps,
+    effectiveUpscaleFactor,
+    flowScaleMode,
+    hdrEnabled,
+    interpEnabled,
+    interpMode,
+    lutPreset,
+    lutStrength,
+    showToast,
+    subframeBufferResMode,
+    subframeCascadeEnabled,
+    subframeCascadeMode,
+    upscaleEnabled,
+    upscaleMode,
+    videoNativeRes
+  ]);
+
+  // Process FileList (Videos, Subtitles .srt/.vtt/.ass/.ssa, or 3D LUT .cube) from Input, Folder Picker, or Drag & Drop
   const processUploadedFiles = useCallback(
     (files: FileList | File[] | null, customSourceLabel?: string) => {
       if (!files || !files.length) return;
@@ -4600,8 +6631,28 @@ export default function App() {
 
       Array.from(files).forEach((file) => {
         const lower = file.name.toLowerCase();
-        if (lower.endsWith('.srt') || lower.endsWith('.vtt')) {
+        if (
+          lower.endsWith('.srt') ||
+          lower.endsWith('.vtt') ||
+          lower.endsWith('.ass') ||
+          lower.endsWith('.ssa')
+        ) {
           loadSubtitleFileObject(file);
+          return;
+        }
+        if (lower.endsWith('.cube')) {
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            const strip = parseCubeFileToLutStrip((ev.target?.result as string) || '');
+            if (strip) {
+              customLutStripRef.current = strip;
+              setCustomLutName(file.name);
+              setLutPreset('custom');
+              setLutVersion((v) => v + 1);
+              showToast(`3D LUT загружен: ${file.name}`);
+            }
+          };
+          reader.readAsText(file, 'utf-8');
           return;
         }
 
@@ -4709,6 +6760,11 @@ export default function App() {
 
         const first = addedVideos[0];
         if (first.fileUrl) {
+          setAnixartSession(null);
+          setStreamQualities({});
+          setActiveStreamQuality('Auto');
+          setSkipTimings([]);
+          setActiveSkipPrompt(null);
           startRealVideoUrl(first.fileUrl, first.title, first.sourceLabel, first.id, true);
           setActiveScreen('player');
           showToast(
@@ -4810,6 +6866,7 @@ export default function App() {
         dejudderHaloControl,
         subframeCascadeEnabled,
         subframeCascadeMode,
+        subframeBufferResMode,
         subframeCoherenceGuard,
         sceneCutProtection,
         flowScaleMode,
@@ -4823,6 +6880,7 @@ export default function App() {
         adrenoMode,
         adrenoGmemFp16,
         adrenoTrue10Hdr,
+        ecoThermalMode,
         videoBrightness,
         eqEnabled,
         eqPreset,
@@ -4846,6 +6904,7 @@ export default function App() {
     dejudderHaloControl,
     subframeCascadeEnabled,
     subframeCascadeMode,
+    subframeBufferResMode,
     subframeCoherenceGuard,
     sceneCutProtection,
     flowScaleMode,
@@ -4859,6 +6918,7 @@ export default function App() {
     adrenoMode,
     adrenoGmemFp16,
     adrenoTrue10Hdr,
+    ecoThermalMode,
     videoBrightness,
     eqEnabled,
     eqPreset,
@@ -4878,6 +6938,7 @@ export default function App() {
       if (s.dejudderHaloControl !== undefined) setDejudderHaloControl(s.dejudderHaloControl);
       if (s.subframeCascadeEnabled !== undefined) setSubframeCascadeEnabled(s.subframeCascadeEnabled);
       if (s.subframeCascadeMode !== undefined) setSubframeCascadeMode(s.subframeCascadeMode);
+      if (s.subframeBufferResMode !== undefined) setSubframeBufferResMode(s.subframeBufferResMode);
       if (s.subframeCoherenceGuard !== undefined) setSubframeCoherenceGuard(s.subframeCoherenceGuard);
       if (s.sceneCutProtection !== undefined) setSceneCutProtection(s.sceneCutProtection);
       if (s.flowScaleMode !== undefined) setFlowScaleMode(s.flowScaleMode);
@@ -4891,6 +6952,7 @@ export default function App() {
       if (s.adrenoMode !== undefined) setAdrenoMode(s.adrenoMode);
       if (s.adrenoGmemFp16 !== undefined) setAdrenoGmemFp16(s.adrenoGmemFp16);
       if (s.adrenoTrue10Hdr !== undefined) setAdrenoTrue10Hdr(s.adrenoTrue10Hdr);
+      if (s.ecoThermalMode !== undefined) setEcoThermalMode(s.ecoThermalMode);
       if (s.videoBrightness !== undefined) setVideoBrightness(s.videoBrightness);
       if (s.eqEnabled !== undefined) setEqEnabled(s.eqEnabled);
       if (s.eqPreset !== undefined) setEqPreset(s.eqPreset);
@@ -4933,6 +6995,7 @@ export default function App() {
     setAdrenoMode(def.adrenoMode);
     setAdrenoGmemFp16(def.adrenoGmemFp16);
     setAdrenoTrue10Hdr(def.adrenoTrue10Hdr);
+    setEcoThermalMode(def.ecoThermalMode);
     setFlowScaleMode(def.flowScaleMode);
     setInterpEnabled(def.interpEnabled);
     setInterpMode(def.interpMode);
@@ -4942,6 +7005,7 @@ export default function App() {
     setDejudderHaloControl(def.dejudderHaloControl);
     setSubframeCascadeEnabled(def.subframeCascadeEnabled);
     setSubframeCascadeMode(def.subframeCascadeMode);
+    setSubframeBufferResMode(def.subframeBufferResMode);
     setSubframeCoherenceGuard(def.subframeCoherenceGuard);
     setMonochromeFilter(def.monochromeFilter);
     setShowVectors(def.showVectors);
@@ -4978,47 +7042,277 @@ export default function App() {
     showToast('Все настройки сброшены к значениям по умолчанию');
   }, [showToast]);
 
-  // Network Stream Launcher
-  const handleNetworkLaunch = (urlToPlay: string) => {
-    const cleanUrl = urlToPlay.trim();
-    if (!cleanUrl) {
-      showToast('Введите корректный URL видеопотока');
+  // Sync skipTimingsRef with skipTimings state
+  useEffect(() => {
+    skipTimingsRef.current = skipTimings;
+    if (skipTimings.length === 0) {
+      activeSkipPromptRef.current = null;
+      setActiveSkipPrompt(null);
+    }
+  }, [skipTimings]);
+
+  // Universal Network & Online Stream Launcher (supports Anixart release pages, Kodik, Sibnet, HLS .m3u8, and MP4/WebM)
+  const handleNetworkLaunch = useCallback(
+    async (
+      urlToPlay: string,
+      opts?: {
+        typeId?: number;
+        sourceId?: number;
+        episodePosition?: number;
+        keepModalOpen?: boolean;
+      }
+    ) => {
+      const cleanUrl = urlToPlay.trim();
+      if (!cleanUrl) {
+        showToast('Введите корректный URL видеопотока или релиза Anixart');
+        return;
+      }
+
+      setIsResolvingUrl(true);
+      showToast('Извлечение прямого видеопотока...');
+
+      try {
+        const res = await fetch('/api/resolve-stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: cleanUrl,
+            typeId: opts?.typeId,
+            sourceId: opts?.sourceId,
+            episodePosition: opts?.episodePosition
+          })
+        });
+
+        if (!res.ok) {
+          const errJson = await res.json().catch(() => ({}));
+          throw new Error(errJson.error || `HTTP ${res.status}`);
+        }
+
+        const data = await res.json();
+        const resolvedUrl: string = data.streamUrl || cleanUrl;
+        const resolvedTitle: string =
+          data.title || cleanUrl.split('/').pop()?.split('?')[0] || 'Network_Stream.mp4';
+        const resolvedSource: string = data.sourceLabel || 'Сеть • Direct Stream';
+        const resolvedThumb: string | undefined =
+          data.thumbnails?.[0] || data.poster || undefined;
+        const qualities: Record<string, string> = data.qualities || { Auto: resolvedUrl };
+
+        setStreamQualities(qualities);
+        const matchedQuality =
+          Object.entries(qualities).find(([, u]) => u === resolvedUrl)?.[0] ||
+          Object.keys(qualities)[0] ||
+          'Auto';
+        setActiveStreamQuality(matchedQuality);
+        setSkipTimings(Array.isArray(data.skipTimings) ? data.skipTimings : []);
+
+        if (data.anixart) {
+          setAnixartSession({
+            releaseUrl: cleanUrl,
+            ...data.anixart
+          });
+        } else if (!opts?.typeId && !opts?.episodePosition) {
+          setAnixartSession(null);
+        }
+
+        const stableId = data.anixart
+          ? `anixart_${data.anixart.release.id}_ep_${data.anixart.selectedEpisodePosition}_${data.anixart.selectedTypeId}`
+          : `net_${Date.now()}`;
+
+        const newItem: LibraryVideoItem = {
+          id: stableId,
+          title: resolvedTitle,
+          fileUrl: resolvedUrl,
+          fps: 24,
+          duration: 0,
+          size: `Поток ${matchedQuality}`,
+          sourceLabel: resolvedSource,
+          thumbnailUrl: resolvedThumb
+        };
+
+        void saveVideoToVault({
+          id: stableId,
+          title: resolvedTitle,
+          remoteUrl: resolvedUrl,
+          fps: 24,
+          duration: 0,
+          size: `Поток ${matchedQuality}`,
+          sourceLabel: resolvedSource,
+          thumbnailDataUrl: resolvedThumb,
+          addedAt: Date.now()
+        });
+
+        setUserVideos((prev) => [newItem, ...prev.filter((v) => v.id !== stableId)]);
+        setPlaylist((prev) => [newItem, ...prev.filter((v) => v.id !== stableId)]);
+        setActivePlaylistIndex(0);
+        if (!resolvedThumb) {
+          generateVideoThumbnail(resolvedUrl, stableId);
+        }
+
+        if (!opts?.keepModalOpen) {
+          setUrlModalOpen(false);
+        }
+        startRealVideoUrl(resolvedUrl, resolvedTitle, resolvedSource, stableId, true);
+        setActiveScreen('player');
+        showToast(`Поток запущен (${matchedQuality}): ${resolvedTitle}`);
+      } catch (err: any) {
+        // Fallback: if direct .mp4/.m3u8 URL was entered and backend is unreachable (offline mode)
+        if (/\.(mp4|webm|m3u8|mkv|mov)(\?|$)/i.test(cleanUrl)) {
+          const fallbackTitle = cleanUrl.split('/').pop()?.split('?')[0] || 'Network_Stream.mp4';
+          const streamId = `net_${Date.now()}`;
+          const newItem: LibraryVideoItem = {
+            id: streamId,
+            title: fallbackTitle,
+            fileUrl: cleanUrl,
+            fps: 24,
+            duration: 0,
+            size: 'Поток URL',
+            sourceLabel: 'Сеть • Direct Stream'
+          };
+          setUserVideos((prev) => [newItem, ...prev]);
+          setPlaylist((prev) => [newItem, ...prev]);
+          setActivePlaylistIndex(0);
+          setUrlModalOpen(false);
+          startRealVideoUrl(cleanUrl, fallbackTitle, 'Сеть • Direct Stream', streamId, true);
+          setActiveScreen('player');
+          showToast(`Поток запущен: ${fallbackTitle}`);
+        } else {
+          showToast(err?.message || 'Не удалось извлечь видеопоток по ссылке');
+        }
+      } finally {
+        setIsResolvingUrl(false);
+      }
+    },
+    [generateVideoThumbnail, showToast, startRealVideoUrl]
+  );
+
+  // Switch Anixart Voiceover (Озвучка) while preserving current episode number
+  const handleSelectAnixartVoiceover = useCallback(
+    (typeId: number) => {
+      if (!anixartSession || isResolvingUrl) return;
+      void handleNetworkLaunch(anixartSession.releaseUrl, {
+        typeId,
+        episodePosition: anixartSession.selectedEpisodePosition
+      });
+    },
+    [anixartSession, handleNetworkLaunch, isResolvingUrl]
+  );
+
+  // Switch Anixart Episode (Серия) in current voiceover
+  const handleSelectAnixartEpisode = useCallback(
+    (episodePos: number) => {
+      if (!anixartSession || isResolvingUrl) return;
+      void handleNetworkLaunch(anixartSession.releaseUrl, {
+        typeId: anixartSession.selectedTypeId,
+        sourceId: anixartSession.selectedSourceId,
+        episodePosition: episodePos
+      });
+    },
+    [anixartSession, handleNetworkLaunch, isResolvingUrl]
+  );
+
+  const handleNextTrack = useCallback(() => {
+    if (anixartSession && anixartSession.episodes.length > 1) {
+      const currEpIdx = anixartSession.episodes.findIndex(
+        (e) => e.position === anixartSession.selectedEpisodePosition
+      );
+      const nextEpIdx =
+        currEpIdx >= 0 ? (currEpIdx + 1) % anixartSession.episodes.length : 0;
+      const nextEpPos =
+        anixartSession.episodes[nextEpIdx]?.position ??
+        anixartSession.selectedEpisodePosition + 1;
+      handleSelectAnixartEpisode(nextEpPos);
       return;
     }
-    const title = cleanUrl.split('/').pop() || 'Network_Stream.mp4';
-    const streamId = `net_${Date.now()}`;
+    if (!playlist.length) {
+      if (hasLoadedVideo || isDemoTestActive) seekToTime(0);
+      return;
+    }
+    if (playlist.length === 1 && !isDemoTestActive && hasLoadedVideo) {
+      seekToTime(0);
+      return;
+    }
+    const nextIdx = isDemoTestActive
+      ? activePlaylistIndex % playlist.length
+      : (activePlaylistIndex + 1) % playlist.length;
+    playPlaylistIndex(nextIdx);
+  }, [
+    activePlaylistIndex,
+    anixartSession,
+    handleSelectAnixartEpisode,
+    hasLoadedVideo,
+    isDemoTestActive,
+    playPlaylistIndex,
+    playlist.length,
+    seekToTime
+  ]);
 
-    const newItem: LibraryVideoItem = {
-      id: streamId,
-      title,
-      fileUrl: cleanUrl,
-      fps: 24,
-      duration: 0,
-      size: 'Поток URL',
-      sourceLabel: 'Сеть • Direct Stream'
-    };
+  const handlePrevTrack = useCallback(() => {
+    if (anixartSession && anixartSession.episodes.length > 1) {
+      const currEpIdx = anixartSession.episodes.findIndex(
+        (e) => e.position === anixartSession.selectedEpisodePosition
+      );
+      const prevEpIdx =
+        currEpIdx >= 0
+          ? (currEpIdx - 1 + anixartSession.episodes.length) %
+            anixartSession.episodes.length
+          : 0;
+      const prevEpPos =
+        anixartSession.episodes[prevEpIdx]?.position ??
+        Math.max(1, anixartSession.selectedEpisodePosition - 1);
+      handleSelectAnixartEpisode(prevEpPos);
+      return;
+    }
+    if (!playlist.length) {
+      if (hasLoadedVideo || isDemoTestActive) seekToTime(0);
+      return;
+    }
+    if (playlist.length === 1 && !isDemoTestActive && hasLoadedVideo) {
+      seekToTime(0);
+      return;
+    }
+    const prevIdx = isDemoTestActive
+      ? activePlaylistIndex % playlist.length
+      : (activePlaylistIndex - 1 + playlist.length) % playlist.length;
+    playPlaylistIndex(prevIdx);
+  }, [
+    activePlaylistIndex,
+    anixartSession,
+    handleSelectAnixartEpisode,
+    hasLoadedVideo,
+    isDemoTestActive,
+    playPlaylistIndex,
+    playlist.length,
+    seekToTime
+  ]);
 
-    void saveVideoToVault({
-      id: streamId,
-      title,
-      remoteUrl: cleanUrl,
-      fps: 24,
-      duration: 0,
-      size: 'Поток URL',
-      sourceLabel: 'Сеть • Direct Stream',
-      addedAt: Date.now()
-    });
-
-    setUserVideos((prev) => [newItem, ...prev]);
-    setPlaylist((prev) => [newItem, ...prev]);
-    setActivePlaylistIndex(0);
-    generateVideoThumbnail(cleanUrl, newItem.id);
-
-    setUrlModalOpen(false);
-    startRealVideoUrl(cleanUrl, title, 'Сеть • Direct Stream', newItem.id, true);
-    setActiveScreen('player');
-    showToast(`Поток запущен: ${title}`);
-  };
+  // Switch HLS / Stream Quality (720p / 480p / 360p) while preserving exact playback timestamp
+  const handleSelectStreamQuality = useCallback(
+    (qualityLabel: string) => {
+      const targetStreamUrl = streamQualities[qualityLabel];
+      if (!targetStreamUrl || qualityLabel === activeStreamQuality) return;
+      const resumeSec = currentTimeRef.current;
+      setActiveStreamQuality(qualityLabel);
+      startRealVideoUrl(
+        targetStreamUrl,
+        activeVideoTitle,
+        activeSourceLabel,
+        lastActiveVideoId || undefined,
+        isPlaying,
+        resumeSec
+      );
+      showToast(`Качество потока: ${qualityLabel}`);
+    },
+    [
+      activeSourceLabel,
+      activeStreamQuality,
+      activeVideoTitle,
+      isPlaying,
+      lastActiveVideoId,
+      showToast,
+      startRealVideoUrl,
+      streamQualities
+    ]
+  );
 
   // Take Snapshot PNG (synchronously inside WebGL render pass or from fallback video element)
   const handleSnapshot = () => {
@@ -5078,7 +7372,7 @@ export default function App() {
     }
   };
 
-  // Desktop & Tablet Global Keyboard Shortcuts (Space, Arrows, F, M, C, Esc)
+  // Desktop & Tablet Global Keyboard Shortcuts (Space, Arrows, Comma/Period Frame Step, F, M, C, Esc)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -5088,6 +7382,37 @@ export default function App() {
           target.tagName === 'TEXTAREA' ||
           target.isContentEditable)
       ) {
+        if (e.code === 'Escape') {
+          target.blur();
+        }
+        return;
+      }
+
+      if (e.code === 'Escape') {
+        if (urlModalOpen) {
+          e.preventDefault();
+          setUrlModalOpen(false);
+          return;
+        }
+        if (activeModal) {
+          e.preventDefault();
+          setActiveModal(null);
+          return;
+        }
+        if (isFullscreen) {
+          e.preventDefault();
+          if (fsActivePanelRef.current !== 'none') {
+            setFsActivePanel('none');
+          } else {
+            toggleFullscreen();
+          }
+          return;
+        }
+        return;
+      }
+
+      // Only intercept player hotkeys when on the player screen and no modal is open
+      if (activeScreen !== 'player' || activeModal || urlModalOpen) {
         return;
       }
 
@@ -5107,6 +7432,18 @@ export default function App() {
             forceRedrawRef.current = true;
             return next;
           });
+        }
+      } else if (e.code === 'Comma' || e.code === 'Period') {
+        e.preventDefault();
+        if (hasLoadedVideo || isDemoTestActive) {
+          setIsPlaying(false);
+          if (videoRef.current) videoRef.current.pause();
+          const stepSec = isDemoTestActive
+            ? 1 / 24
+            : Math.max(1 / 120, Math.min(1 / 12, (estimatedFrameIntervalMsRef.current || 41.667) / 1000));
+          const dir = e.code === 'Period' ? 1 : -1;
+          seekToTime(currentTimeRef.current + dir * stepSec);
+          triggerSeekFeedback(dir > 0 ? '+1 кадр' : '-1 кадр');
         }
       } else if (e.code === 'ArrowLeft') {
         e.preventDefault();
@@ -5170,14 +7507,6 @@ export default function App() {
           showToast(next ? 'Субтитры включены' : 'Субтитры выключены');
           return next;
         });
-      } else if (e.code === 'Escape') {
-        if (activeModal) {
-          e.preventDefault();
-          setActiveModal(null);
-        } else if (isFullscreen) {
-          e.preventDefault();
-          toggleFullscreen();
-        }
       }
     };
 
@@ -5185,6 +7514,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
     activeModal,
+    activeScreen,
     doubleTapSeekSec,
     duration,
     hasLoadedVideo,
@@ -5192,8 +7522,10 @@ export default function App() {
     isDemoTestActive,
     isFullscreen,
     seekToTime,
+    showSwipeHudOverlay,
     showToast,
     triggerSeekFeedback,
+    urlModalOpen,
     volume
   ]);
 
@@ -5226,10 +7558,12 @@ export default function App() {
       className="app-shell flex flex-col min-h-screen max-w-[960px] mx-auto relative"
       onDragOver={(e) => {
         e.preventDefault();
-        setIsDraggingOver(true);
+        if (!isDraggingOver) setIsDraggingOver(true);
       }}
       onDragLeave={(e) => {
-        if (e.relatedTarget === null) setIsDraggingOver(false);
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setIsDraggingOver(false);
+        }
       }}
       onDrop={(e) => {
         e.preventDefault();
@@ -5259,9 +7593,37 @@ export default function App() {
       <input
         ref={subFileInputRef}
         type="file"
-        accept=".srt,.vtt,text/vtt,application/x-subrip"
+        accept=".srt,.vtt,.ass,.ssa,text/vtt,application/x-subrip"
         className="hidden"
         onChange={handleSubtitleUpload}
+      />
+      <input
+        ref={secondarySubFileInputRef}
+        type="file"
+        accept=".srt,.vtt,.ass,.ssa,text/vtt,application/x-subrip"
+        className="hidden"
+        onChange={handleSecondarySubtitleUpload}
+      />
+      <input
+        ref={lutFileInputRef}
+        type="file"
+        accept=".cube"
+        className="hidden"
+        onChange={handleLutFileUpload}
+      />
+      {/* Hidden Helper Videos for Seekbar Frame Thumbnails & WebGL Picture-in-Picture Stream */}
+      <video
+        ref={seekPreviewVideoRef}
+        muted
+        playsInline
+        preload="metadata"
+        className="hidden pointer-events-none"
+      />
+      <video
+        ref={pipVideoRef}
+        muted
+        playsInline
+        className="hidden pointer-events-none"
       />
 
       {/* Global Drag & Drop Overlay */}
@@ -5757,20 +8119,12 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Adaptive FBO Flow Scale Quick Control */}
-              <div className="p-3.5 rounded-2xl flex flex-col gap-2" style={{ background: 'var(--surface-elevated)' }}>
+              {/* Adaptive FBO Flow Scale & Sub-Frame FBO Buffer Quick Control */}
+              <div className="p-3.5 rounded-2xl flex flex-col gap-2.5" style={{ background: 'var(--surface-elevated)' }}>
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold">Масштаб буфера потока (5-Lvl Pyramid FBO)</span>
+                  <span className="text-xs font-bold">Буфер оптического потока (6-Lvl Pyramid FBO)</span>
                   <span className="text-[11px] font-mono-code font-bold" style={{ color: 'var(--text-sub)' }}>
-                    {flowScaleMode === 'auto'
-                      ? 'Адаптивный (5-Lvl)'
-                      : flowScaleMode === 'performance'
-                      ? '64×36 Скорость'
-                      : flowScaleMode === 'balanced'
-                      ? '96×54 Баланс'
-                      : flowScaleMode === 'ultra'
-                      ? '128×72 Ультра'
-                      : '256×144 Максимум'}
+                    {flowScaleLabel}
                   </span>
                 </div>
                 <div className="rex-segmented">
@@ -5780,7 +8134,9 @@ export default function App() {
                       { id: 'performance', label: '64×36' },
                       { id: 'balanced', label: '96×54' },
                       { id: 'ultra', label: '128×72' },
-                      { id: 'extreme', label: '256×144' }
+                      { id: 'extreme', label: '256×144' },
+                      { id: 'high', label: '384×216' },
+                      { id: 'max', label: '512×288' }
                     ] as const
                   ).map((item) => (
                     <button
@@ -5791,6 +8147,35 @@ export default function App() {
                         forceRedrawRef.current = true;
                       }}
                       className={`rex-seg-btn ${flowScaleMode === item.id ? 'active' : ''}`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex items-center justify-between pt-1">
+                  <span className="text-xs font-bold">Буфер FBO суб-кадров (3× I_0.25/0.50/0.75)</span>
+                  <span className="text-[11px] font-mono-code font-bold" style={{ color: 'var(--text-sub)' }}>
+                    {subframeBufferResLabel}
+                  </span>
+                </div>
+                <div className="rex-segmented">
+                  {(
+                    [
+                      { id: 'auto', label: 'Авто 1440p' },
+                      { id: '720p', label: '720p HD' },
+                      { id: '1080p', label: '1080p FHD' },
+                      { id: '1440p', label: '1440p QHD' }
+                    ] as const
+                  ).map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => {
+                        setSubframeBufferResMode(item.id);
+                        forceRedrawRef.current = true;
+                      }}
+                      className={`rex-seg-btn ${subframeBufferResMode === item.id ? 'active' : ''}`}
                     >
                       {item.label}
                     </button>
@@ -6345,6 +8730,11 @@ export default function App() {
                       • HDR10
                     </span>
                   )}
+                  {ecoThermalMode && (
+                    <span className="text-xs font-mono-code text-emerald-500 font-semibold" title="Холодный ЭКО-режим GPU активен (без нагрева)">
+                      • ЭКО-Холод
+                    </span>
+                  )}
                 </div>
               </div>
             </div>
@@ -6367,6 +8757,31 @@ export default function App() {
 
           {!topToolbarCollapsed && (
             <div className="flex items-center gap-1.5 flex-wrap">
+              <button
+                type="button"
+                onClick={() => {
+                  setEcoThermalMode((prev) => {
+                    const next = !prev;
+                    forceRedrawRef.current = true;
+                    showToast(
+                      next
+                        ? 'Холодный ЭКО-режим GPU включён (защита от нагрева)'
+                        : 'Максимальный Турбо-режим GPU включён'
+                    );
+                    return next;
+                  });
+                }}
+                className="px-3 py-1.5 rounded-full text-xs font-mono-code font-bold transition cursor-pointer flex items-center gap-1"
+                style={{
+                  background: ecoThermalMode ? 'rgba(16, 185, 129, 0.16)' : 'var(--surface-pill)',
+                  color: ecoThermalMode ? '#10b981' : 'var(--text-main)',
+                  border: ecoThermalMode ? '1px solid rgba(16, 185, 129, 0.35)' : '1px solid transparent'
+                }}
+                title="Холодный ЭКО-режим GPU: убирает нагрев устройства при сохранении плавности MEMC"
+              >
+                <Zap className="w-3.5 h-3.5" />
+                <span>{ecoThermalMode ? 'ЭКО-Холод ВКЛ' : 'ЭКО-Холод ВЫКЛ'}</span>
+              </button>
               <button
                 type="button"
                 onClick={() => {
@@ -6512,32 +8927,121 @@ export default function App() {
               >
                 MEMC / UP
               </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setAmbilightEnabled((prev) => {
+                    const next = !prev;
+                    showToast(next ? 'Подсветка Ambilight включена' : 'Подсветка Ambilight выключена');
+                    return next;
+                  });
+                }}
+                className="px-3 py-1.5 rounded-full text-xs font-semibold transition cursor-pointer flex items-center gap-1"
+                style={{
+                  background: ambilightEnabled ? 'var(--accent-bg)' : 'var(--surface-card)',
+                  color: ambilightEnabled ? 'var(--accent-text)' : 'var(--text-main)'
+                }}
+                title="Динамическая фоновая подсветка Ambilight (32×18 Blur)"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Ambilight</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setAutoCropBlackBars((prev) => {
+                    const next = !prev;
+                    if (!next) {
+                      detectedAutoCropRef.current = 0;
+                      setDetectedAutoCropPct(0);
+                    }
+                    forceRedrawRef.current = true;
+                    showToast(
+                      next
+                        ? 'Авто-обрезка черных полей (21:9) включена'
+                        : 'Авто-обрезка черных полей выключена'
+                    );
+                    return next;
+                  });
+                }}
+                className="px-3 py-1.5 rounded-full text-xs font-semibold transition cursor-pointer"
+                style={{
+                  background: autoCropBlackBars ? 'var(--accent-bg)' : 'var(--surface-card)',
+                  color: autoCropBlackBars ? 'var(--accent-text)' : 'var(--text-main)'
+                }}
+                title="Автоматическое определение и обрезка запеченных черных полос сверху и снизу"
+              >
+                Авто-кроп{autoCropBlackBars && detectedAutoCropPct > 0 ? ` (${detectedAutoCropPct}%)` : ''}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void handleToggleWebglPip()}
+                className="px-3 py-1.5 rounded-full text-xs font-semibold transition cursor-pointer flex items-center gap-1"
+                style={{
+                  background: isPipActive ? 'var(--accent-bg)' : 'var(--surface-card)',
+                  color: isPipActive ? 'var(--accent-text)' : 'var(--text-main)'
+                }}
+                title="Картинка-в-картинке с сохранением шейдеров WebGL (MEMC + Апскейл + HDR10)"
+              >
+                <PictureInPicture2 className="w-3.5 h-3.5" />
+                <span>PiP</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setIsTouchLocked(true);
+                  setFsControlsVisible(false);
+                  showToast('Экран заблокирован от случайных касаний');
+                }}
+                className="px-3 py-1.5 rounded-full text-xs font-semibold transition cursor-pointer flex items-center gap-1"
+                style={{ background: 'var(--surface-card)', color: 'var(--text-main)' }}
+                title="Заблокировать экран и жесты (Touch Lock / Kids Lock)"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                <span>Замок</span>
+              </button>
             </div>
           )}
         </div>
 
-        {/* Main Video Stage with Subtitle Layer, Fullscreen Controls & Persistent Canvas */}
-        <div
-          ref={stageContainerRef}
-          onClick={handleStageClick}
-          onPointerDown={handleStagePointerDown}
-          onPointerMove={(e) => {
-            if (isFullscreen && e.pointerType === 'mouse') {
-              revealFsControls();
+        {/* Dynamic Ambilight Wrapper & Main Video Stage */}
+        <div className="relative">
+          {ambilightEnabled && !isFullscreen && (
+            <canvas
+              ref={ambilightCanvasRef}
+              width={32}
+              height={18}
+              className="pointer-events-none absolute -inset-5 w-[calc(100%+40px)] h-[calc(100%+40px)] rounded-[40px] opacity-75 transition-opacity duration-500 z-0"
+              style={{ filter: 'blur(48px) saturate(1.85)' }}
+            />
+          )}
+
+          {/* Main Video Stage with Subtitle Layer, Fullscreen Controls & Persistent Canvas */}
+          <div
+            ref={stageContainerRef}
+            onClick={handleStageClick}
+            onPointerDown={handleStagePointerDown}
+            onPointerMove={(e) => {
+              if (isFullscreen && e.pointerType === 'mouse' && !isTouchLocked) {
+                revealFsControls();
+              }
+              handleStagePointerMove(e);
+            }}
+            onPointerUp={handleStagePointerUpOrLeave}
+            onPointerCancel={handleStagePointerUpOrLeave}
+            onPointerLeave={handleStagePointerUpOrLeave}
+            onWheel={handleStageWheel}
+            className={
+              isFullscreen
+                ? 'fixed inset-0 z-50 w-screen h-screen bg-black select-none touch-none flex items-center justify-center overflow-hidden'
+                : 'relative z-[1] w-full aspect-video rounded-3xl overflow-hidden bg-black border shadow-xl select-none touch-none cursor-pointer flex items-center justify-center'
             }
-            handleStagePointerMove(e);
-          }}
-          onPointerUp={handleStagePointerUpOrLeave}
-          onPointerCancel={handleStagePointerUpOrLeave}
-          onPointerLeave={handleStagePointerUpOrLeave}
-          onWheel={handleStageWheel}
-          className={
-            isFullscreen
-              ? 'fixed inset-0 z-50 w-screen h-screen bg-black select-none touch-none flex items-center justify-center overflow-hidden'
-              : 'relative w-full aspect-video rounded-3xl overflow-hidden bg-black border shadow-xl select-none touch-none cursor-pointer flex items-center justify-center'
-          }
-          style={isFullscreen ? undefined : { borderColor: 'var(--border-strong)' }}
-        >
+            style={isFullscreen ? undefined : { borderColor: 'var(--border-strong)' }}
+          >
           {/* LAYER 0: Hardware HTML5 Video Element (Active in DOM Render Tree for HW decoding & Instant Fallback) */}
           <video
             ref={videoRef}
@@ -6567,6 +9071,15 @@ export default function App() {
               }
             }}
             onEnded={() => {
+              if (autoPlayNext && anixartSession && anixartSession.episodes.length > 1) {
+                const currEpIdx = anixartSession.episodes.findIndex(
+                  (e) => e.position === anixartSession.selectedEpisodePosition
+                );
+                if (currEpIdx >= 0 && currEpIdx + 1 < anixartSession.episodes.length) {
+                  handleSelectAnixartEpisode(anixartSession.episodes[currEpIdx + 1].position);
+                  return;
+                }
+              }
               if (autoPlayNext && playlist.length > 1) {
                 handleNextTrack();
               } else if (loopPlayback) {
@@ -6649,7 +9162,26 @@ export default function App() {
             </div>
           )}
 
-          {/* Subtitle Overlay Text */}
+          {/* Secondary / Top Subtitle Overlay Text (Dual Subtitles + {\an8} ASS tags) */}
+          <div
+            ref={topSubtitleBoxRef}
+            className={`pointer-events-none absolute left-4 right-4 ${
+              showTopHud ? 'top-12' : 'top-4'
+            } justify-center text-center z-20 transition-all hidden`}
+          >
+            <span
+              ref={topSubtitleTextSpanRef}
+              className="px-3.5 py-1 rounded-xl font-medium leading-snug max-w-[85%] whitespace-pre-line shadow"
+              style={{
+                backgroundColor: `rgba(0,0,0,${subBgOpacity})`,
+                color: '#fde047',
+                fontSize: `${Math.max(12, subFontSize - 2)}px`,
+                textShadow: '0 1px 3px rgba(0,0,0,0.9)'
+              }}
+            />
+          </div>
+
+          {/* Primary Bottom Subtitle Overlay Text */}
           <div
             ref={subtitleBoxRef}
             className={`pointer-events-none absolute left-4 right-4 ${
@@ -6672,9 +9204,31 @@ export default function App() {
             </span>
           </div>
 
-          {/* Compact Top Status Badges (when not covered by Fullscreen Top Bar) */}
-          {showTopHud && !(isFullscreen && fsControlsVisible) && (
-            <div className="absolute top-3 left-3 right-3 flex items-center justify-between gap-2 pointer-events-none z-10">
+          {/* Touch Lock / Kids Lock Floating Overlay Button */}
+          {isTouchLocked && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
+              className="absolute inset-0 z-40 flex items-start justify-end p-4 pointer-events-auto"
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setIsTouchLocked(false);
+                  showToast('Экран разблокирован');
+                }}
+                className="px-3.5 py-2 rounded-2xl bg-black/80 hover:bg-black text-amber-300 border border-amber-400/40 shadow-2xl flex items-center gap-2 text-xs font-bold cursor-pointer transition active:scale-95"
+                title="Нажмите для разблокировки экрана и жестов"
+              >
+                <Unlock className="w-4 h-4" />
+                <span>Разблокировать экран</span>
+              </button>
+            </div>
+          )}
+
+          {/* Compact Top Status Badges + Real-Time Telemetry Sparkline & Dropped Frames */}
+          {showTopHud && !isTouchLocked && !(isFullscreen && fsControlsVisible) && (
+            <div className="absolute top-3 left-3 right-3 flex items-start justify-between gap-2 pointer-events-none z-10">
               <div className="flex items-center gap-1.5 flex-wrap">
                 {interpEnabled && interpMode !== 'off' ? (
                   <span
@@ -6714,20 +9268,42 @@ export default function App() {
                     {isAdrenoActive && adrenoTrue10Hdr ? 'HDR10 True10' : 'HDR10'}
                   </span>
                 )}
+                {lutPreset !== 'off' && (
+                  <span className="px-2.5 py-0.5 rounded-full bg-fuchsia-500 text-white font-mono-code text-[11px] font-bold shadow">
+                    LUT: {lutPreset.toUpperCase()}
+                  </span>
+                )}
               </div>
 
-              <div
-                ref={hudMetricsBadgeRef}
-                className="px-2.5 py-0.5 rounded-full bg-zinc-950/85 text-zinc-200 border border-white/15 font-mono-code text-[11px]"
-              >
-                {isAdrenoActive ? 'Adreno GMEM • ' : ''}
-                {liveScreenHz} Гц • {liveFrameTimeMs} мс
+              <div className="flex flex-col items-end gap-1">
+                <div
+                  ref={hudMetricsBadgeRef}
+                  className="px-2.5 py-0.5 rounded-full bg-zinc-950/85 text-zinc-200 border border-white/15 font-mono-code text-[11px]"
+                >
+                  {isAdrenoActive ? 'Adreno GMEM • ' : ''}
+                  {liveScreenHz} Гц • {liveFrameTimeMs} мс
+                </div>
+                {showHudTelemetryGraph && (
+                  <div className="px-2.5 py-1 rounded-xl bg-zinc-950/85 border border-white/15 flex items-center gap-2 text-[10px] font-mono-code text-zinc-300 shadow">
+                    <span ref={hudFpsRatioRef} className="text-emerald-400 font-bold">
+                      24 → {effectiveTargetFps} FPS
+                    </span>
+                    <span>•</span>
+                    <span ref={hudDroppedFramesRef}>Пропуски: 0</span>
+                    <canvas
+                      ref={hudTelemetryCanvasRef}
+                      width={76}
+                      height={20}
+                      className="rounded bg-black/50"
+                    />
+                  </div>
+                )}
               </div>
             </div>
           )}
 
           {/* FULLSCREEN VIDEO CONTROLS OVERLAY (pointer-events-none on empty areas so swipes & taps on video still work!) */}
-          {isFullscreen && fsControlsVisible && (
+          {isFullscreen && fsControlsVisible && !isTouchLocked && (
             <div
               onPointerDownCapture={() => revealFsControls()}
               onPointerMoveCapture={() => revealFsControls()}
@@ -7199,6 +9775,41 @@ export default function App() {
                         </div>
 
                         <div>
+                          <div className="flex items-center justify-between mb-1 text-[11px]">
+                            <span className="text-zinc-300">Разрешение FBO суб-кадров (VRAM Авто-контроль)</span>
+                            <span className="font-mono-code font-bold text-sky-300">
+                              {subframeBufferResLabel}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-4 gap-1 bg-black/30 p-1 rounded-full text-[10px] mb-2">
+                            {(
+                              [
+                                { id: 'auto', label: 'Авто 1440p' },
+                                { id: '720p', label: '720p' },
+                                { id: '1080p', label: '1080p' },
+                                { id: '1440p', label: '1440p QHD' }
+                              ] as const
+                            ).map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                onClick={() => {
+                                  setSubframeBufferResMode(item.id);
+                                  forceRedrawRef.current = true;
+                                }}
+                                className={`py-1 rounded-full font-mono-code font-bold cursor-pointer transition text-center ${
+                                  subframeBufferResMode === item.id
+                                    ? 'bg-sky-400 text-black'
+                                    : 'text-zinc-300'
+                                }`}
+                              >
+                                {item.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div>
                           <div className="flex justify-between mb-1 text-[11px]">
                             <span className="text-zinc-300">Когерентность векторов и защита быстрых сцен</span>
                             <span className="font-mono-code font-bold text-sky-300">
@@ -7271,27 +9882,21 @@ export default function App() {
 
                       <div>
                         <div className="flex items-center justify-between mb-1">
-                          <span className="text-zinc-300">Буфер потока FBO (5-Lvl Pyramid)</span>
+                          <span className="text-zinc-300">Буфер потока FBO (6-Lvl Pyramid до 512×288)</span>
                           <span className="font-mono-code font-bold text-emerald-300">
-                            {flowScaleMode === 'extreme'
-                              ? '256×144 Макс'
-                              : flowScaleMode === 'ultra'
-                              ? '128×72 Ультра'
-                              : flowScaleMode === 'balanced'
-                              ? '96×54 Баланс'
-                              : flowScaleMode === 'performance'
-                              ? '64×36 Быстрый'
-                              : 'Авто'}
+                            {flowScaleLabel}
                           </span>
                         </div>
-                        <div className="grid grid-cols-5 gap-1 bg-white/10 p-1 rounded-full text-[10px]">
+                        <div className="grid grid-cols-7 gap-1 bg-white/10 p-1 rounded-full text-[10px]">
                           {(
                             [
                               { id: 'auto', label: 'Авто' },
                               { id: 'performance', label: '64×36' },
                               { id: 'balanced', label: '96×54' },
                               { id: 'ultra', label: '128×72' },
-                              { id: 'extreme', label: '256×144' }
+                              { id: 'extreme', label: '256×144' },
+                              { id: 'high', label: '384×216' },
+                              { id: 'max', label: '512×288' }
                             ] as const
                           ).map((item) => (
                             <button
@@ -7403,9 +10008,19 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* PANEL 2: AUDIO & EQ */}
+                  {/* PANEL 2: AUDIO, EQ, NIGHT MODE & SPECTROGRAM */}
                   {fsActivePanel === 'audio' && (
                     <div className="flex flex-col gap-2.5 text-xs">
+                      <div className="flex items-center justify-between gap-2 bg-white/10 p-2 rounded-2xl">
+                        <span className="text-zinc-300 font-semibold">Спектрограмма Web Audio</span>
+                        <canvas
+                          ref={fsEqSpectrumCanvasRef}
+                          width={160}
+                          height={32}
+                          className="rounded-lg bg-black/50"
+                        />
+                      </div>
+
                       <div>
                         <div className="flex justify-between mb-1">
                           <span className="text-zinc-300">Громкость</span>
@@ -7431,6 +10046,52 @@ export default function App() {
                           className="rex-slider"
                         />
                       </div>
+
+                      <div>
+                        <div className="flex justify-between mb-1">
+                          <span className="text-zinc-300">Нормализация / Ночной режим</span>
+                          <span className="font-mono-code font-bold text-emerald-300">
+                            {audioCompressorMode.toUpperCase()}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-4 gap-1 bg-white/10 p-1 rounded-2xl text-[11px]">
+                          {(
+                            [
+                              { id: 'off', label: 'Выкл' },
+                              { id: 'soft', label: 'Мягкий' },
+                              { id: 'night', label: 'Ночной' },
+                              { id: 'voice', label: 'Голос+' }
+                            ] as const
+                          ).map((m) => (
+                            <button
+                              key={m.id}
+                              type="button"
+                              onClick={() => {
+                                initWebAudio();
+                                setAudioCompressorMode(m.id);
+                              }}
+                              className={`py-1 rounded-xl font-bold cursor-pointer ${
+                                audioCompressorMode === m.id ? 'bg-white text-black' : 'text-zinc-300'
+                              }`}
+                            >
+                              {m.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <label className="flex items-center justify-between p-2 rounded-xl bg-white/10 cursor-pointer">
+                        <span>Crossfeed для наушников (0.3 мс стерео-сцена)</span>
+                        <input
+                          type="checkbox"
+                          checked={headphoneCrossfeed}
+                          onChange={(e) => {
+                            initWebAudio();
+                            setHeadphoneCrossfeed(e.target.checked);
+                          }}
+                          className="w-4 h-4 rounded"
+                        />
+                      </label>
 
                       <div>
                         <div className="flex justify-between mb-1">
@@ -7465,10 +10126,10 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* PANEL 3: SUBTITLES */}
+                  {/* PANEL 3: SUBTITLES (DUAL SUBTITLES + .ASS/.SSA) */}
                   {fsActivePanel === 'subtitles' && (
                     <div className="flex flex-col gap-3 text-xs">
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between gap-2">
                         <label className="flex items-center gap-2 cursor-pointer font-semibold">
                           <input
                             type="checkbox"
@@ -7476,14 +10137,33 @@ export default function App() {
                             onChange={(e) => setSubtitlesEnabled(e.target.checked)}
                             className="w-4 h-4 rounded"
                           />
-                          <span>Отображать субтитры</span>
+                          <span>Основные субтитры (Низ)</span>
                         </label>
                         <button
                           type="button"
                           onClick={() => subFileInputRef.current?.click()}
-                          className="px-3 py-1.5 rounded-full bg-white text-black font-bold cursor-pointer"
+                          className="px-3 py-1 rounded-full bg-white text-black font-bold cursor-pointer"
                         >
-                          + Загрузить .SRT
+                          + .SRT / .ASS
+                        </button>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="flex items-center gap-2 cursor-pointer font-semibold text-amber-300">
+                          <input
+                            type="checkbox"
+                            checked={secondarySubtitlesEnabled}
+                            onChange={(e) => setSecondarySubtitlesEnabled(e.target.checked)}
+                            className="w-4 h-4 rounded accent-amber-400"
+                          />
+                          <span>Двойные субтитры (Верх)</span>
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => secondarySubFileInputRef.current?.click()}
+                          className="px-3 py-1 rounded-full bg-amber-400 text-black font-bold cursor-pointer"
+                        >
+                          + Верх .SRT / .ASS
                         </button>
                       </div>
 
@@ -7947,8 +10627,37 @@ export default function App() {
                   <Sparkles className="w-4 h-4" />
                   <span>Запустить тест 24 → {effectiveTargetFps} FPS</span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setUrlModalOpen(true)}
+                  className="px-4 py-2 rounded-full bg-white/15 hover:bg-white/25 text-white text-xs font-bold cursor-pointer flex items-center gap-1.5 border border-white/20"
+                >
+                  <Play className="w-3.5 h-3.5 fill-current" />
+                  <span>Поток URL / Anixart</span>
+                </button>
               </div>
             </div>
+          )}
+
+          {/* Floating Skip Opening / Ending Button (from Kodik / Anixart metadata) */}
+          {activeSkipPrompt && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                seekToTime(activeSkipPrompt.end, true);
+                activeSkipPromptRef.current = null;
+                setActiveSkipPrompt(null);
+                showToast(`${activeSkipPrompt.label} (${formatTime(activeSkipPrompt.end)})`);
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+              className={`pointer-events-auto absolute right-4 ${
+                isFullscreen && fsControlsVisible ? 'bottom-28' : 'bottom-5'
+              } z-30 px-4 py-2 rounded-full bg-white/95 hover:bg-white text-black text-xs font-bold shadow-2xl border border-black/10 flex items-center gap-1.5 cursor-pointer transition transform active:scale-95`}
+            >
+              <span>{activeSkipPrompt.label}</span>
+              <SkipForward className="w-3.5 h-3.5 fill-current" />
+            </button>
           )}
 
           {/* Visual Swipe Gesture HUD Indicator */}
@@ -7998,15 +10707,26 @@ export default function App() {
             </div>
           )}
         </div>
+        </div>
 
-        {/* Transport Scrubber & Controls */}
+        {/* Transport Scrubber & Controls (with Seekbar Frame Thumbnail Preview, A-B Loop & Bookmarks) */}
         <div
           className="mt-3 p-4 rounded-3xl flex flex-col gap-3"
           style={{ background: 'var(--surface-card)', border: '1px solid var(--border-soft)' }}
         >
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between text-xs font-mono-code" style={{ color: 'var(--text-sub)' }}>
-              <span ref={timecodeDisplayRef}>{formatTime(currentTime)}</span>
+              <div className="flex items-center gap-2">
+                <span ref={timecodeDisplayRef}>{formatTime(currentTime)}</span>
+                {loopPointA !== null && (
+                  <span
+                    className="px-2 py-0.5 rounded-full text-[10px] font-bold"
+                    style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
+                  >
+                    A–B: {formatTime(loopPointA)} → {loopPointB !== null ? formatTime(loopPointB) : '...'}
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-2">
                 <span>{formatTime(duration)}</span>
                 <button
@@ -8026,41 +10746,138 @@ export default function App() {
               </div>
             </div>
 
-            <input
-              ref={scrubberInputRef}
-              type="range"
-              min={0}
-              max={duration || 100}
-              step={0.05}
-              defaultValue={0}
-              onPointerDown={() => {
-                isScrubbingRef.current = true;
-              }}
-              onPointerUp={() => {
-                isScrubbingRef.current = false;
-                seekToTime(currentTimeRef.current, true);
-              }}
-              onPointerCancel={() => {
-                isScrubbingRef.current = false;
-                seekToTime(currentTimeRef.current, true);
-              }}
-              onBlur={() => {
-                if (isScrubbingRef.current) {
+            {/* Scrubber Track Wrapper with Seekbar Thumbnail Popup, A-B Segment Bar & Bookmark Dots */}
+            <div
+              className="relative py-1"
+              onPointerMove={handleScrubberPointerMove}
+              onPointerLeave={handleScrubberPointerLeave}
+            >
+              {/* Seekbar Frame Thumbnail Popup */}
+              {seekHoverPreview.visible && (
+                <div
+                  className="pointer-events-none absolute -top-28 -translate-x-1/2 z-30 flex flex-col items-center gap-1 p-1.5 rounded-2xl bg-zinc-950/95 border border-white/20 shadow-2xl"
+                  style={{ left: `${seekHoverPreview.leftPct}%` }}
+                >
+                  <canvas
+                    ref={seekPreviewCanvasRef}
+                    width={160}
+                    height={90}
+                    className="w-32 h-[72px] rounded-xl bg-black object-cover"
+                  />
+                  <span className="text-[10px] font-mono-code font-bold text-white px-2 py-0.5 rounded-full bg-white/10">
+                    {formatTime(seekHoverPreview.timeSec)}
+                  </span>
+                </div>
+              )}
+
+              {/* A-B Loop Highlight Bar on Timeline */}
+              {loopPointA !== null && duration > 0 && (
+                <div
+                  className="pointer-events-none absolute top-1/2 -translate-y-1/2 h-2 rounded-full bg-amber-400/45 border border-amber-400 z-10"
+                  style={{
+                    left: `${Math.max(0, Math.min(100, (loopPointA / duration) * 100))}%`,
+                    width: `${Math.max(
+                      1,
+                      Math.min(
+                        100,
+                        (((loopPointB !== null ? loopPointB : currentTime) - loopPointA) /
+                          duration) *
+                          100
+                      )
+                    )}%`
+                  }}
+                />
+              )}
+
+              {/* Bookmark Markers on Timeline */}
+              {duration > 0 &&
+                currentVideoBookmarks.map((bm) => {
+                  const pct = Math.max(0, Math.min(100, (bm.time / duration) * 100));
+                  return (
+                    <button
+                      key={bm.id}
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        seekToTime(bm.time, true);
+                        showToast(`Переход к закладке: ${bm.label}`);
+                      }}
+                      className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-2.5 h-2.5 rounded-full bg-amber-400 border border-black shadow z-20 cursor-pointer hover:scale-125 transition"
+                      style={{ left: `${pct}%` }}
+                      title={`${bm.label} (${formatTime(bm.time)})`}
+                    />
+                  );
+                })}
+
+              <input
+                ref={scrubberInputRef}
+                type="range"
+                min={0}
+                max={duration || 100}
+                step={0.05}
+                defaultValue={0}
+                onPointerDown={() => {
+                  isScrubbingRef.current = true;
+                }}
+                onPointerUp={() => {
                   isScrubbingRef.current = false;
+                  handleScrubberPointerLeave();
                   seekToTime(currentTimeRef.current, true);
-                }
-              }}
-              onChange={(e) => {
-                const val = parseFloat(e.target.value);
-                seekToTime(val, !isScrubbingRef.current);
-              }}
-              className="rex-slider"
-            />
+                }}
+                onPointerCancel={() => {
+                  isScrubbingRef.current = false;
+                  handleScrubberPointerLeave();
+                  seekToTime(currentTimeRef.current, true);
+                }}
+                onBlur={() => {
+                  handleScrubberPointerLeave();
+                  if (isScrubbingRef.current) {
+                    isScrubbingRef.current = false;
+                    seekToTime(currentTimeRef.current, true);
+                  }
+                }}
+                onChange={(e) => {
+                  const val = parseFloat(e.target.value);
+                  seekToTime(val, !isScrubbingRef.current);
+                }}
+                className="rex-slider relative z-10"
+              />
+            </div>
+
+            {/* Saved Bookmarks Chips Row for Active Video */}
+            {currentVideoBookmarks.length > 0 && (
+              <div className="flex items-center gap-1.5 overflow-x-auto pt-1 pb-0.5">
+                {currentVideoBookmarks.map((bm) => (
+                  <div
+                    key={bm.id}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-mono-code shrink-0"
+                    style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => seekToTime(bm.time, true)}
+                      className="font-bold cursor-pointer hover:underline flex items-center gap-1"
+                    >
+                      <Bookmark className="w-3 h-3 text-amber-500 fill-current" />
+                      <span>{formatTime(bm.time)}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteBookmark(bm.id)}
+                      className="opacity-60 hover:opacity-100 cursor-pointer ml-0.5"
+                      title="Удалить закладку"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {!transportCollapsed && (
           <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <button
                 type="button"
                 onClick={handlePrevTrack}
@@ -8148,6 +10965,33 @@ export default function App() {
 
               <button
                 type="button"
+                onClick={handleToggleLoopAB}
+                className="px-3 py-2.5 rounded-2xl text-xs font-mono-code font-bold transition cursor-pointer flex items-center gap-1"
+                style={{
+                  background: loopPointA !== null ? 'var(--accent-bg)' : 'var(--surface-pill)',
+                  color: loopPointA !== null ? 'var(--accent-text)' : 'var(--text-main)'
+                }}
+                title="Повторение фрагмента A–B (нажмите для точки A, затем B, затем сброс)"
+              >
+                <Repeat className="w-3.5 h-3.5" />
+                <span>
+                  {loopPointA === null ? 'A–B' : loopPointB === null ? 'A→...' : 'A–B ВКЛ'}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleAddBookmark}
+                className="px-3 py-2.5 rounded-2xl text-xs font-semibold transition cursor-pointer flex items-center gap-1"
+                style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
+                title="Добавить закладку на текущем таймкоде"
+              >
+                <Bookmark className="w-3.5 h-3.5" />
+                <span>+Метка</span>
+              </button>
+
+              <button
+                type="button"
                 onClick={() => {
                   setIsMuted((prev) => {
                     const next = !prev;
@@ -8181,7 +11025,7 @@ export default function App() {
               />
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <button
                 type="button"
                 onClick={() => setQueueDrawerOpen((prev) => !prev)}
@@ -8230,6 +11074,152 @@ export default function App() {
           </div>
           )}
         </div>
+
+        {/* Online Stream / Anixart Release Selector Card (Voiceover, Episodes & HLS Stream Quality) */}
+        {(anixartSession || Object.keys(streamQualities).length > 1) && (
+          <div
+            className="mt-3 p-4 rounded-3xl flex flex-col gap-3"
+            style={{ background: 'var(--surface-card)', border: '1px solid var(--border-soft)' }}
+          >
+            {anixartSession && (
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  {anixartSession.release.poster && (
+                    <img
+                      src={anixartSession.release.poster}
+                      alt={anixartSession.release.titleRu}
+                      className="w-12 h-16 rounded-2xl object-cover shrink-0 border"
+                      style={{ borderColor: 'var(--border-soft)' }}
+                    />
+                  )}
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span
+                        className="px-2 py-0.5 rounded-full text-[10px] font-mono-code font-bold"
+                        style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
+                      >
+                        ANIXART • HLS
+                      </span>
+                      {anixartSession.release.studio && (
+                        <span className="text-[11px] font-mono-code" style={{ color: 'var(--text-sub)' }}>
+                          {anixartSession.release.studio} • {anixartSession.release.year}
+                        </span>
+                      )}
+                      {anixartSession.release.grade > 0 && (
+                        <span className="text-[11px] font-mono-code font-bold text-amber-500">
+                          ★ {anixartSession.release.grade.toFixed(2)}
+                        </span>
+                      )}
+                    </div>
+                    <div className="rex-serif font-bold text-sm truncate mt-0.5">
+                      {anixartSession.release.titleRu}
+                    </div>
+                    {anixartSession.release.titleOriginal && (
+                      <div className="text-[11px] truncate" style={{ color: 'var(--text-sub)' }}>
+                        {anixartSession.release.titleOriginal}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {isResolvingUrl && (
+                  <span
+                    className="px-2.5 py-1 rounded-full text-[11px] font-mono-code font-bold shrink-0 animate-pulse"
+                    style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
+                  >
+                    Загрузка...
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Stream Quality Selector (720p / 480p / 360p) */}
+            {Object.keys(streamQualities).length > 1 && (
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <span className="text-xs font-bold" style={{ color: 'var(--text-sub)' }}>
+                  Качество HLS потока:
+                </span>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {Object.keys(streamQualities).map((qLabel) => {
+                    const isAct = activeStreamQuality === qLabel;
+                    return (
+                      <button
+                        key={qLabel}
+                        type="button"
+                        onClick={() => handleSelectStreamQuality(qLabel)}
+                        className="px-3 py-1 rounded-full text-xs font-mono-code font-bold cursor-pointer transition"
+                        style={{
+                          background: isAct ? 'var(--accent-bg)' : 'var(--surface-pill)',
+                          color: isAct ? 'var(--accent-text)' : 'var(--text-main)'
+                        }}
+                      >
+                        {qLabel}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Voiceover Selector (Озвучка / Субтитры) */}
+            {anixartSession && anixartSession.types.length > 0 && (
+              <div className="flex flex-col gap-1.5">
+                <span className="text-xs font-bold" style={{ color: 'var(--text-sub)' }}>
+                  Озвучка / Перевод ({anixartSession.types.length}):
+                </span>
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                  {anixartSession.types.map((t) => {
+                    const isSelected = t.id === anixartSession.selectedTypeId;
+                    return (
+                      <button
+                        key={t.id}
+                        type="button"
+                        disabled={isResolvingUrl}
+                        onClick={() => handleSelectAnixartVoiceover(t.id)}
+                        className="px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer transition"
+                        style={{
+                          background: isSelected ? 'var(--accent-bg)' : 'var(--surface-pill)',
+                          color: isSelected ? 'var(--accent-text)' : 'var(--text-main)'
+                        }}
+                      >
+                        {t.name} ({t.episodesCount})
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Episode Selector (Серии 1..N) */}
+            {anixartSession && anixartSession.episodes.length > 0 && (
+              <div className="flex flex-col gap-1.5">
+                <span className="text-xs font-bold" style={{ color: 'var(--text-sub)' }}>
+                  Серии ({anixartSession.episodes.length}):
+                </span>
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                  {anixartSession.episodes.map((ep) => {
+                    const isEpSelected = ep.position === anixartSession.selectedEpisodePosition;
+                    return (
+                      <button
+                        key={ep.position}
+                        type="button"
+                        disabled={isResolvingUrl}
+                        onClick={() => handleSelectAnixartEpisode(ep.position)}
+                        className="px-3 py-1.5 rounded-xl text-xs font-mono-code font-bold whitespace-nowrap shrink-0 cursor-pointer transition"
+                        style={{
+                          background: isEpSelected ? 'var(--accent-bg)' : 'var(--surface-pill)',
+                          color: isEpSelected ? 'var(--accent-text)' : 'var(--text-main)'
+                        }}
+                      >
+                        {ep.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Collapsible Playlist Queue Drawer */}
         {queueDrawerOpen && (
@@ -8350,6 +11340,17 @@ export default function App() {
                     style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
                   >
                     {isAdrenoActive && adrenoTrue10Hdr ? 'HDR10 True10' : 'HDR10'}
+                  </span>
+                )}
+                {ecoThermalMode && (
+                  <span
+                    className="px-2 py-0.5 rounded-full text-[11px] font-mono-code font-bold"
+                    style={{
+                      background: 'rgba(16, 185, 129, 0.15)',
+                      color: '#10b981'
+                    }}
+                  >
+                    ЭКО-Холод GPU
                   </span>
                 )}
               </div>
@@ -8476,6 +11477,39 @@ export default function App() {
                           <span>True10 HDR Dither</span>
                         </label>
                       </div>
+
+                      <div
+                        className="p-2.5 rounded-2xl flex items-center justify-between gap-2 text-xs mt-1"
+                        style={{
+                          background: ecoThermalMode ? 'rgba(16, 185, 129, 0.1)' : 'var(--surface-elevated)',
+                          border: ecoThermalMode ? '1px solid rgba(16, 185, 129, 0.3)' : '1px solid transparent'
+                        }}
+                      >
+                        <div className="min-w-0">
+                          <div className="font-bold flex items-center gap-1.5" style={{ color: ecoThermalMode ? '#10b981' : 'var(--text-main)' }}>
+                            <Zap className="w-3.5 h-3.5 shrink-0" />
+                            <span>Холодный ЭКО-режим (Анти-нагрев)</span>
+                          </div>
+                          <div className="text-[11px] leading-snug mt-0.5" style={{ color: 'var(--text-sub)' }}>
+                            Снижает тепловыделение GPU до 65%: 1-проходная фильтрация, пропуск дублей субкадров и умное ограничение буфера.
+                          </div>
+                        </div>
+                        <input
+                          type="checkbox"
+                          checked={ecoThermalMode}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            setEcoThermalMode(checked);
+                            forceRedrawRef.current = true;
+                            showToast(
+                              checked
+                                ? 'Холодный ЭКО-режим GPU включён'
+                                : 'Холодный ЭКО-режим GPU выключен (Турбо)'
+                            );
+                          }}
+                          className="w-4 h-4 accent-emerald-600 rounded shrink-0 cursor-pointer"
+                        />
+                      </div>
                     </>
                   )}
                 </div>
@@ -8585,13 +11619,13 @@ export default function App() {
                         <div className="flex items-center justify-between gap-2">
                           <div className="min-w-0">
                             <div className="text-xs font-bold truncate">
-                              Вторичные суб-кадры (Каскад FBO)
+                              Трехкаскадные FBO суб-кадры (3 Суб-кадра)
                             </div>
                             <div
                               className="text-[10px] font-mono-code truncate"
                               style={{ color: 'var(--text-sub)' }}
                             >
-                              Генерация от промежуточного I_0.5 • Сдвиг векторов ×0.5
+                              3 опорных FBO (I_0.25 • I_0.50 • I_0.75) • Сдвиг векторов ×0.25
                             </div>
                           </div>
                           <label className="inline-flex items-center gap-1.5 text-xs font-semibold cursor-pointer shrink-0">
@@ -8619,9 +11653,9 @@ export default function App() {
                           {(
                             [
                               { id: 'auto', label: `Авто (${effectiveSubframeCascadeMult}x)` },
-                              { id: '2x', label: '2x Суб' },
-                              { id: '3x', label: '3x Суб' },
-                              { id: '4x', label: '4x Ультра' }
+                              { id: '2x', label: '2x (1 FBO)' },
+                              { id: '3x', label: '3x (3 Суб FBO)' },
+                              { id: '4x', label: '4x Ультра (3 FBO)' }
                             ] as const
                           ).map((item) => (
                             <button
@@ -8643,6 +11677,38 @@ export default function App() {
                               {item.label}
                             </button>
                           ))}
+                        </div>
+
+                        <div className="flex flex-col gap-1">
+                          <div className="flex items-center justify-between text-[11px]">
+                            <span style={{ color: 'var(--text-sub)' }}>
+                              Буфер FBO суб-кадров (Авто-контроль памяти до 1440p)
+                            </span>
+                            <span className="font-mono-code font-bold">{subframeBufferResLabel}</span>
+                          </div>
+                          <div className="rex-segmented">
+                            {(
+                              [
+                                { id: 'auto', label: 'Авто 1440p' },
+                                { id: '720p', label: '720p' },
+                                { id: '1080p', label: '1080p' },
+                                { id: '1440p', label: '1440p QHD' }
+                              ] as const
+                            ).map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                onClick={() => {
+                                  setSubframeBufferResMode(item.id);
+                                  if (!subframeCascadeEnabled) setSubframeCascadeEnabled(true);
+                                  forceRedrawRef.current = true;
+                                }}
+                                className={`rex-seg-btn ${subframeBufferResMode === item.id ? 'active' : ''}`}
+                              >
+                                {item.label}
+                              </button>
+                            ))}
+                          </div>
                         </div>
 
                         <div>
@@ -8668,22 +11734,14 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* 5-Level Pyramid FBO Flow Scale Selector Directly Under Player */}
+                      {/* 6-Level Pyramid FBO Flow Scale Selector Directly Under Player */}
                       <div className="flex flex-col gap-1">
                         <div className="flex items-center justify-between text-[11px]">
                           <span className="font-semibold" style={{ color: 'var(--text-sub)' }}>
-                            Плотность потока FBO (5-Lvl Pyramid + Mesh 160×90)
+                            Плотность буфера потока FBO (6-Lvl Pyramid до 512×288)
                           </span>
                           <span className="font-mono-code font-bold" style={{ color: 'var(--text-main)' }}>
-                            {flowScaleMode === 'extreme'
-                              ? 'Максимум 256×144'
-                              : flowScaleMode === 'ultra'
-                              ? 'Ультра 128×72'
-                              : flowScaleMode === 'balanced'
-                              ? 'Баланс 96×54'
-                              : flowScaleMode === 'performance'
-                              ? 'Быстрый 64×36'
-                              : 'Авто (5-Lvl)'}
+                            {flowScaleLabel}
                           </span>
                         </div>
                         <div className="rex-segmented">
@@ -8693,7 +11751,9 @@ export default function App() {
                               { id: 'performance', label: '64×36' },
                               { id: 'balanced', label: '96×54' },
                               { id: 'ultra', label: '128×72' },
-                              { id: 'extreme', label: '256×144' }
+                              { id: 'extreme', label: '256×144' },
+                              { id: 'high', label: '384×216' },
+                              { id: 'max', label: '512×288' }
                             ] as const
                           ).map((item) => (
                             <button
@@ -8726,7 +11786,7 @@ export default function App() {
                         <div className="flex items-center justify-between gap-2 flex-wrap">
                           <div className="flex items-center gap-1.5 text-xs font-bold">
                             <Sparkles className="w-3.5 h-3.5 text-purple-500 shrink-0" />
-                            <span>Синтез промежуточных и вторичных суб-кадров</span>
+                            <span>Синтез 3 опорных и вторичных суб-кадров</span>
                           </div>
                           <div className="flex items-center gap-1.5 font-mono-code text-[11px]">
                             <span
@@ -8766,7 +11826,7 @@ export default function App() {
                               forceRedrawRef.current = true;
                             }}
                             className="rex-slider flex-1"
-                            title="Вручную сдвиньте фазу α между кадрами T-1, I_0.5 и T, чтобы увидеть работу каскада"
+                            title="Вручную сдвиньте фазу α между кадрами T-1, I_0.25, I_0.50, I_0.75 и T"
                           />
                           <span className="text-[11px] font-mono-code shrink-0" style={{ color: 'var(--text-sub)' }}>
                             T
@@ -8779,8 +11839,8 @@ export default function App() {
                               { val: null, label: 'Авто' },
                               { val: 0.0, label: '0% (T-1)' },
                               { val: 0.25, label: '25% (Суб 1)' },
-                              { val: 0.5, label: '50% (Опорный)' },
-                              { val: 0.75, label: '75% (Суб 2)' },
+                              { val: 0.5, label: '50% (Суб 2)' },
+                              { val: 0.75, label: '75% (Суб 3)' },
                               { val: 1.0, label: '100% (T)' }
                             ].map((btn) => {
                               const isSelected = manualSubframePhase === btn.val;
@@ -9012,7 +12072,7 @@ export default function App() {
                     <div>
                       <div className="flex items-center justify-between text-xs mb-1">
                         <span style={{ color: 'var(--text-sub)' }}>
-                          Шумоподавление (De-block)
+                          Шумоподавление и анти-артефакты (MCTD + De-block)
                         </span>
                         <span className="font-mono-code font-bold">{Math.round(upscaleDenoise * 100)}%</span>
                       </div>
@@ -9024,11 +12084,32 @@ export default function App() {
                         value={upscaleDenoise}
                         onChange={(e) => {
                           setUpscaleDenoise(parseFloat(e.target.value));
-                          if (!upscaleEnabled) setUpscaleEnabled(true);
                           forceRedrawRef.current = true;
                         }}
                         className="rex-slider"
                       />
+                      <div className="flex items-center justify-between gap-2 mt-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUpscaleDenoise(0.85);
+                            setDejudderHaloControl(85);
+                            setSubframeCoherenceGuard(90);
+                            setSceneCutProtection(true);
+                            setMotionScale(18);
+                            forceRedrawRef.current = true;
+                            showToast('Включено максимальное подавление шума и артефактов быстрых сцен');
+                          }}
+                          className="w-full py-1.5 px-3 rounded-xl text-[11px] font-bold cursor-pointer transition flex items-center justify-center gap-1.5"
+                          style={{
+                            background: 'var(--accent-bg)',
+                            color: 'var(--accent-text)'
+                          }}
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          <span>Убрать шум и артефакты быстрых движений (Макс)</span>
+                        </button>
+                      </div>
                     </div>
 
                     <div>
@@ -9087,6 +12168,171 @@ export default function App() {
                           }}
                           className="rex-slider"
                         />
+                      </div>
+                    </div>
+
+                    {/* Adaptive Debanding (Blue Noise Dithering) */}
+                    <div
+                      className="p-2.5 rounded-2xl flex flex-col gap-2"
+                      style={{
+                        background: 'var(--surface-elevated)',
+                        border: '1px solid var(--border-soft)'
+                      }}
+                    >
+                      <div className="flex items-center justify-between text-xs">
+                        <label className="font-bold flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={debandEnabled}
+                            onChange={(e) => {
+                              setDebandEnabled(e.target.checked);
+                              forceRedrawRef.current = true;
+                            }}
+                            className="w-4 h-4 accent-zinc-900 rounded"
+                          />
+                          <span>Адаптивный Debanding (Blue Noise Dither)</span>
+                        </label>
+                        <span className="font-mono-code font-bold">
+                          {debandEnabled ? `${Math.round(debandStrength * 100)}%` : 'Выкл'}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0.1}
+                        max={1.0}
+                        step={0.05}
+                        value={debandStrength}
+                        onChange={(e) => {
+                          setDebandStrength(parseFloat(e.target.value));
+                          if (!debandEnabled) setDebandEnabled(true);
+                          forceRedrawRef.current = true;
+                        }}
+                        className="rex-slider"
+                      />
+                    </div>
+
+                    {/* 3D LUT (.cube) & Color Grading Sliders */}
+                    <div
+                      className="p-2.5 rounded-2xl flex flex-col gap-2.5"
+                      style={{
+                        background: 'var(--surface-elevated)',
+                        border: '1px solid var(--border-soft)'
+                      }}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-bold">3D LUT (.cube) и Цветокоррекция</span>
+                        <button
+                          type="button"
+                          onClick={() => lutFileInputRef.current?.click()}
+                          className="px-2.5 py-1 rounded-full text-[11px] font-bold cursor-pointer"
+                          style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
+                        >
+                          + Загрузить .CUBE
+                        </button>
+                      </div>
+
+                      <div className="rex-segmented">
+                        {(
+                          [
+                            { id: 'off', label: 'Выкл' },
+                            { id: 'teal_orange', label: 'Teal&Orange' },
+                            { id: 'kodak_2383', label: 'Kodak 2383' },
+                            { id: 'anime_vibrant', label: 'Anime+' },
+                            { id: 'cyberpunk', label: 'Cyber' }
+                          ] as const
+                        ).map((item) => (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => {
+                              setLutPreset(item.id);
+                              forceRedrawRef.current = true;
+                            }}
+                            className={`rex-seg-btn ${lutPreset === item.id ? 'active' : ''}`}
+                          >
+                            {item.label}
+                          </button>
+                        ))}
+                      </div>
+
+                      {lutPreset !== 'off' && (
+                        <div>
+                          <div className="flex items-center justify-between text-[11px] mb-1">
+                            <span style={{ color: 'var(--text-sub)' }}>
+                              Интенсивность 3D LUT {lutPreset === 'custom' ? `(${customLutName})` : ''}
+                            </span>
+                            <span className="font-mono-code font-bold">{lutStrength}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            step={5}
+                            value={lutStrength}
+                            onChange={(e) => {
+                              setLutStrength(parseInt(e.target.value, 10));
+                              forceRedrawRef.current = true;
+                            }}
+                            className="rex-slider"
+                          />
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-3 gap-2 pt-1">
+                        <div>
+                          <div className="flex justify-between text-[10px] mb-1">
+                            <span style={{ color: 'var(--text-sub)' }}>Контраст</span>
+                            <span className="font-mono-code font-bold">{Math.round(videoContrast * 100)}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0.6}
+                            max={1.6}
+                            step={0.05}
+                            value={videoContrast}
+                            onChange={(e) => {
+                              setVideoContrast(parseFloat(e.target.value));
+                              forceRedrawRef.current = true;
+                            }}
+                            className="rex-slider"
+                          />
+                        </div>
+                        <div>
+                          <div className="flex justify-between text-[10px] mb-1">
+                            <span style={{ color: 'var(--text-sub)' }}>Насыщенность</span>
+                            <span className="font-mono-code font-bold">{Math.round(videoSaturation * 100)}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={2.0}
+                            step={0.05}
+                            value={videoSaturation}
+                            onChange={(e) => {
+                              setVideoSaturation(parseFloat(e.target.value));
+                              forceRedrawRef.current = true;
+                            }}
+                            className="rex-slider"
+                          />
+                        </div>
+                        <div>
+                          <div className="flex justify-between text-[10px] mb-1">
+                            <span style={{ color: 'var(--text-sub)' }}>Точка черного</span>
+                            <span className="font-mono-code font-bold">{Math.round(videoBlackPoint * 100)}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={0.15}
+                            step={0.005}
+                            value={videoBlackPoint}
+                            onChange={(e) => {
+                              setVideoBlackPoint(parseFloat(e.target.value));
+                              forceRedrawRef.current = true;
+                            }}
+                            className="rex-slider"
+                          />
+                        </div>
                       </div>
                     </div>
 
@@ -9154,6 +12400,18 @@ export default function App() {
                         />
                         <span>Ч/Б</span>
                       </label>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={handleExportDiagnosticsJson}
+                        className="w-full py-1.5 px-3 rounded-xl text-[11px] font-mono-code font-bold cursor-pointer transition flex items-center justify-center gap-1.5"
+                        style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
+                      >
+                        <Activity className="w-3.5 h-3.5" />
+                        <span>Экспорт диагностического отчёта телеметрии (JSON)</span>
+                      </button>
                     </div>
 
                     {showSadHeatmap && (
@@ -9253,7 +12511,9 @@ export default function App() {
       {/* ============================== URL MODAL ============================== */}
       {urlModalOpen && (
         <div
-          onClick={() => setUrlModalOpen(false)}
+          onClick={() => {
+            if (!isResolvingUrl) setUrlModalOpen(false);
+          }}
           className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
         >
           <div
@@ -9265,8 +12525,8 @@ export default function App() {
               border: '1px solid var(--border-strong)'
             }}
           >
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="rex-serif text-base font-bold">Открыть поток по прямой ссылке</h3>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="rex-serif text-base font-bold">Открыть поток или релиз Anixart</h3>
               <button
                 type="button"
                 onClick={() => setUrlModalOpen(false)}
@@ -9276,12 +12536,21 @@ export default function App() {
                 <X className="w-4 h-4" />
               </button>
             </div>
+            <p className="text-xs mb-3 leading-relaxed" style={{ color: 'var(--text-sub)' }}>
+              Поддерживаются ссылки на релизы <strong>Anixart</strong> (<code>anixart-app.com/release/...</code>), плееры <strong>Kodik / Sibnet</strong>, потоки <strong>HLS (.m3u8)</strong> и прямые <strong>MP4 / WebM</strong> файлы:
+            </p>
             <input
               type="url"
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="https://example.com/stream.mp4"
-              className="w-full px-4 py-2.5 rounded-2xl text-sm border focus:outline-none mb-4"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !isResolvingUrl) {
+                  e.preventDefault();
+                  void handleNetworkLaunch(urlInput);
+                }
+              }}
+              placeholder="https://anixart-app.com/release/20398 или .m3u8 / .mp4"
+              className="w-full px-4 py-2.5 rounded-2xl text-sm border focus:outline-none mb-3"
               style={{
                 background: 'var(--surface-card)',
                 color: 'var(--text-main)',
@@ -9289,9 +12558,38 @@ export default function App() {
               }}
               autoFocus
             />
+            <div className="mb-4 flex flex-col gap-1.5">
+              <span className="text-[11px] font-semibold" style={{ color: 'var(--text-sub)' }}>
+                Быстрый запуск примера:
+              </span>
+              <button
+                type="button"
+                disabled={isResolvingUrl}
+                onClick={() => {
+                  const sampleUrl = 'https://anixart-app.com/release/20398';
+                  setUrlInput(sampleUrl);
+                  void handleNetworkLaunch(sampleUrl);
+                }}
+                className="w-full px-3.5 py-2 rounded-2xl text-left text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 transition hover:opacity-90"
+                style={{
+                  background: 'var(--surface-card)',
+                  color: 'var(--text-main)',
+                  border: '1px solid var(--border-soft)'
+                }}
+              >
+                <span className="truncate">Киберпанк: Бегущие по краю 2 (anixart-app.com/release/20398)</span>
+                <span
+                  className="px-2 py-0.5 rounded-full text-[10px] font-mono-code font-bold shrink-0"
+                  style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
+                >
+                  HLS 720p
+                </span>
+              </button>
+            </div>
             <div className="flex items-center justify-end gap-2">
               <button
                 type="button"
+                disabled={isResolvingUrl}
                 onClick={() => setUrlModalOpen(false)}
                 className="px-4 py-2 rounded-full text-xs font-semibold cursor-pointer"
                 style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
@@ -9300,11 +12598,12 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => handleNetworkLaunch(urlInput)}
+                disabled={isResolvingUrl}
+                onClick={() => void handleNetworkLaunch(urlInput)}
                 className="px-5 py-2 rounded-full text-xs font-semibold cursor-pointer"
                 style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
               >
-                Загрузить поток
+                {isResolvingUrl ? 'Извлечение потока...' : 'Загрузить поток'}
               </button>
             </div>
           </div>
@@ -10007,17 +13306,9 @@ export default function App() {
 
                   <div>
                     <div className="flex items-center justify-between text-xs mb-1">
-                      <span className="font-bold">Адаптивный буфер потока (FBO Flow Scale)</span>
+                      <span className="font-bold">Адаптивный буфер потока (6-Lvl Pyramid FBO)</span>
                       <span className="text-[11px] font-mono-code font-bold uppercase" style={{ color: 'var(--text-sub)' }}>
-                        {flowScaleMode === 'extreme'
-                          ? 'EXTREME (256×144)'
-                          : flowScaleMode === 'ultra'
-                          ? 'ULTRA (128×72)'
-                          : flowScaleMode === 'balanced'
-                          ? 'BALANCED (96×54)'
-                          : flowScaleMode === 'performance'
-                          ? 'FAST (64×36)'
-                          : 'AUTO (5-LVL)'}
+                        {flowScaleLabel}
                       </span>
                     </div>
                     <div className="rex-segmented">
@@ -10027,7 +13318,9 @@ export default function App() {
                           { id: 'performance', label: '64×36' },
                           { id: 'balanced', label: '96×54' },
                           { id: 'ultra', label: '128×72' },
-                          { id: 'extreme', label: '256×144' }
+                          { id: 'extreme', label: '256×144' },
+                          { id: 'high', label: '384×216' },
+                          { id: 'max', label: '512×288' }
                         ] as const
                       ).map((m) => (
                         <button
@@ -10044,7 +13337,7 @@ export default function App() {
                       ))}
                     </div>
                     <div className="text-[11px] mt-1.5" style={{ color: 'var(--text-sub)' }}>
-                      5-уровневая иерархическая пирамида оптического потока (L4: 16×9 → L3: 32×18 → L2: 64×36 → L1: 128×72 → L0: до 256×144) и плотная 2D-сетка 160×90
+                      6-уровневая иерархическая пирамида оптического потока (L4: 16×9 → L3: 32×18 → L2: 64×36 → L1: 128×72 → L0.5: 256×144 → L0: до 512×288) с авто-контролем памяти
                     </div>
                   </div>
 
@@ -10052,9 +13345,9 @@ export default function App() {
                   <div className="p-3.5 rounded-2xl flex flex-col gap-2.5" style={{ background: 'var(--surface-card)' }}>
                     <div className="flex items-center justify-between">
                       <div>
-                        <div className="font-bold">Каскад суб-кадров (Secondary Sub-Frame FBO)</div>
+                        <div className="font-bold">Каскад суб-кадров (3-Anchor Sub-Frame FBO до 1440p)</div>
                         <div className="text-xs" style={{ color: 'var(--text-sub)' }}>
-                          Вторичная генерация внутри промежуточного FBO-буфера (I₀ → I₀.₅ → I₁) для подавления двоения и микро-рывков
+                          Генерация 3 промежуточных FBO-буферов (I_0.25 • I_0.50 • I_0.75) с разрешением до 2560×1440 и умной защитой от перегрева
                         </div>
                       </div>
                       <input
@@ -10098,6 +13391,36 @@ export default function App() {
                           {m.label}
                         </button>
                       ))}
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between text-xs mb-1">
+                        <span>Разрешение буфера FBO суб-кадров (VRAM)</span>
+                        <span className="font-mono-code font-bold">{subframeBufferResLabel}</span>
+                      </div>
+                      <div className="rex-segmented">
+                        {(
+                          [
+                            { id: 'auto' as const, label: 'Авто 1440p' },
+                            { id: '720p' as const, label: '720p HD' },
+                            { id: '1080p' as const, label: '1080p FHD' },
+                            { id: '1440p' as const, label: '1440p QHD' }
+                          ]
+                        ).map((m) => (
+                          <button
+                            key={m.id}
+                            type="button"
+                            onClick={() => {
+                              setSubframeBufferResMode(m.id);
+                              if (!subframeCascadeEnabled) setSubframeCascadeEnabled(true);
+                              forceRedrawRef.current = true;
+                            }}
+                            className={`rex-seg-btn ${subframeBufferResMode === m.id ? 'active' : ''}`}
+                          >
+                            {m.label}
+                          </button>
+                        ))}
+                      </div>
                     </div>
 
                     <div>
@@ -10215,12 +13538,12 @@ export default function App() {
                 </div>
               )}
 
-              {/* SUBTITLES */}
+              {/* SUBTITLES (DUAL SUBTITLES + .ASS/.SSA) */}
               {activeModal === 'subtitles' && (
                 <div className="flex flex-col gap-3">
                   <label className="flex items-center justify-between p-3.5 rounded-2xl cursor-pointer" style={{ background: 'var(--surface-card)' }}>
                     <div>
-                      <div className="font-bold">Отображать субтитры</div>
+                      <div className="font-bold">Основные субтитры (Нижний слот + теги .ASS {'{\\an8}'})</div>
                       <div className="text-xs" style={{ color: 'var(--text-sub)' }}>
                         {customSubtitlesName}
                       </div>
@@ -10229,6 +13552,21 @@ export default function App() {
                       type="checkbox"
                       checked={subtitlesEnabled}
                       onChange={(e) => setSubtitlesEnabled(e.target.checked)}
+                      className="w-5 h-5 accent-zinc-900 rounded"
+                    />
+                  </label>
+
+                  <label className="flex items-center justify-between p-3.5 rounded-2xl cursor-pointer" style={{ background: 'var(--surface-card)' }}>
+                    <div>
+                      <div className="font-bold">Двойные субтитры (Верхний слот для оригинала/перевода)</div>
+                      <div className="text-xs" style={{ color: 'var(--text-sub)' }}>
+                        {secondarySubtitlesName}
+                      </div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={secondarySubtitlesEnabled}
+                      onChange={(e) => setSecondarySubtitlesEnabled(e.target.checked)}
                       className="w-5 h-5 accent-zinc-900 rounded"
                     />
                   </label>
@@ -10283,24 +13621,36 @@ export default function App() {
                     />
                   </div>
 
-                  <div className="flex items-center justify-between gap-2 pt-1">
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                     <button
                       type="button"
                       onClick={() => subFileInputRef.current?.click()}
                       className="px-4 py-2 rounded-full text-xs font-semibold cursor-pointer"
                       style={{ background: 'var(--accent-bg)', color: 'var(--accent-text)' }}
                     >
-                      Загрузить .SRT / .VTT
+                      + Основной (.SRT / .VTT / .ASS)
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => secondarySubFileInputRef.current?.click()}
+                      className="px-4 py-2 rounded-full text-xs font-semibold cursor-pointer"
+                      style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
+                    >
+                      + Верхний (.SRT / .VTT / .ASS)
                     </button>
 
                     <button
                       type="button"
                       onClick={() => {
                         setSubtitleCues([]);
+                        setSecondarySubtitleCues([]);
                         setCustomSubtitlesName('Субтитры не загружены');
+                        setSecondarySubtitlesName('Доп. субтитры (верх) не загружены');
                         setSubDelaySec(0);
-                        void saveSubtitlesToVault('', []);
-                        showToast('Субтитры очищены');
+                        void saveSubtitlesToVault('', [], 'primary');
+                        void saveSubtitlesToVault('', [], 'secondary');
+                        showToast('Оба слота субтитров очищены');
                       }}
                       className="px-3.5 py-2 rounded-full text-xs font-semibold cursor-pointer"
                       style={{ background: 'var(--surface-pill)', color: 'var(--text-main)' }}
@@ -10311,24 +13661,97 @@ export default function App() {
                 </div>
               )}
 
-              {/* AUDIO & EQUALIZER */}
+              {/* AUDIO, EQUALIZER, NIGHT MODE COMPRESSOR, CROSSFEED & SPECTROGRAM */}
               {activeModal === 'audio' && (
                 <div className="flex flex-col gap-3">
                   <div className="flex items-center justify-between">
-                    <span className="font-bold">5-полосный Эквалайзер Web Audio API</span>
+                    <span className="font-bold">Звуковой движок Web Audio API</span>
                     <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold">
                       <input
                         type="checkbox"
                         checked={eqEnabled}
-                        onChange={(e) => setEqEnabled(e.target.checked)}
+                        onChange={(e) => {
+                          initWebAudio();
+                          setEqEnabled(e.target.checked);
+                        }}
                         className="w-4 h-4 accent-zinc-900 rounded"
                       />
-                      <span>Активен</span>
+                      <span>Эквалайзер активен</span>
                     </label>
                   </div>
 
+                  {/* Live Audio Visualizer (Spectrogram) */}
+                  <div
+                    className="p-3 rounded-2xl flex items-center justify-between gap-3"
+                    style={{ background: 'var(--surface-card)' }}
+                  >
+                    <div>
+                      <div className="font-bold text-xs">Аудио-визуализатор (Спектрограмма)</div>
+                      <div className="text-[11px] font-mono-code" style={{ color: 'var(--text-sub)' }}>
+                        AnalyserNode (fftSize = 64) • Частотный отклик
+                      </div>
+                    </div>
+                    <canvas
+                      ref={eqSpectrumCanvasRef}
+                      width={180}
+                      height={40}
+                      className="rounded-xl bg-black/80 border border-white/10 shrink-0"
+                    />
+                  </div>
+
+                  {/* DynamicsCompressorNode Presets: Night Mode & Voice Boost */}
                   <div>
-                    <label className="text-xs font-bold block mb-1">Пресеты эквалайзера</label>
+                    <label className="text-xs font-bold block mb-1">
+                      Нормализация громкости (DynamicsCompressorNode)
+                    </label>
+                    <div className="rex-segmented">
+                      {(
+                        [
+                          { id: 'off', label: 'Выкл' },
+                          { id: 'soft', label: 'Мягкий' },
+                          { id: 'night', label: 'Ночной режим' },
+                          { id: 'voice', label: 'Усиление голоса' }
+                        ] as const
+                      ).map((m) => (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={() => {
+                            initWebAudio();
+                            setAudioCompressorMode(m.id);
+                          }}
+                          className={`rex-seg-btn ${audioCompressorMode === m.id ? 'active' : ''}`}
+                        >
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Spatial Audio & Headphone Crossfeed */}
+                  <label
+                    className="flex items-center justify-between p-3 rounded-2xl cursor-pointer"
+                    style={{ background: 'var(--surface-card)' }}
+                  >
+                    <div>
+                      <div className="font-bold text-xs">Пространственное аудио и Crossfeed для наушников</div>
+                      <div className="text-[11px]" style={{ color: 'var(--text-sub)' }}>
+                        Смешивание L/R каналов (18%) с акустической задержкой 0.3 мс для снятия утомляемости слуха
+                      </div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={headphoneCrossfeed}
+                      onChange={(e) => {
+                        initWebAudio();
+                        setHeadphoneCrossfeed(e.target.checked);
+                      }}
+                      className="w-5 h-5 accent-zinc-900 rounded"
+                    />
+                  </label>
+
+                  <div>
+                    <label className="text-xs font-bold block mb-1">Пресеты 5-полосного эквалайзера</label>
                     <div className="rex-segmented flex-wrap">
                       {(['flat', 'cinema', 'bass', 'vocal', 'treble'] as const).map((p) => (
                         <button

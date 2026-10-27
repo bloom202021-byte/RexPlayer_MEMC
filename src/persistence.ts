@@ -2,6 +2,16 @@ export interface SubtitleCue {
   start: number;
   end: number;
   text: string;
+  align?: number; // 1..9 ASS alignment (\an8 = top center, \an2 = bottom center)
+  posX?: number;
+  posY?: number;
+}
+
+export interface VideoBookmark {
+  id: string;
+  time: number;
+  label: string;
+  createdAt: number;
 }
 
 export interface PersistedAppSettings {
@@ -14,6 +24,15 @@ export interface PersistedAppSettings {
   volume: number;
   isMuted: boolean;
   videoBrightness: number;
+  videoContrast: number;
+  videoSaturation: number;
+  videoBlackPoint: number;
+  debandEnabled: boolean;
+  debandStrength: number;
+  ambilightEnabled: boolean;
+  autoCropBlackBars: boolean;
+  lutPreset: 'off' | 'teal_orange' | 'kodak_2383' | 'anime_vibrant' | 'cyberpunk' | 'custom';
+  lutStrength: number;
   hdrEnabled: boolean;
   hdrStrength: number;
   upscaleEnabled: boolean;
@@ -24,7 +43,9 @@ export interface PersistedAppSettings {
   adrenoMode: 'auto' | 'on' | 'off';
   adrenoGmemFp16: boolean;
   adrenoTrue10Hdr: boolean;
-  flowScaleMode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme';
+  ecoThermalMode: boolean;
+  flowScaleMode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme' | 'high' | 'max';
+  subframeBufferResMode: 'auto' | '720p' | '1080p' | '1440p';
   processorMenuCollapsed: boolean;
   topToolbarCollapsed: boolean;
   fsToolbarCollapsed: boolean;
@@ -52,6 +73,7 @@ export interface PersistedAppSettings {
   sceneCutProtection: boolean;
   splitCompareMode: boolean;
   subtitlesEnabled: boolean;
+  secondarySubtitlesEnabled: boolean;
   subFontSize: number;
   subDelaySec: number;
   subBgOpacity: number;
@@ -60,11 +82,14 @@ export interface PersistedAppSettings {
   preampGain: number;
   pitchCorrection: boolean;
   eqBands: [number, number, number, number, number];
+  audioCompressorMode: 'off' | 'soft' | 'night' | 'voice';
+  headphoneCrossfeed: boolean;
   autoPlayNext: boolean;
   loopPlayback: boolean;
   rememberPosition: boolean;
   autoBindMediaOnStart: boolean;
   showTopHud: boolean;
+  showHudTelemetryGraph: boolean;
   showStepButtons: boolean;
   showSnapshotBtn: boolean;
   doubleTapSeekSec: number;
@@ -85,7 +110,9 @@ export interface ProcessorPresetSettings {
   adrenoMode: 'auto' | 'on' | 'off';
   adrenoGmemFp16: boolean;
   adrenoTrue10Hdr: boolean;
-  flowScaleMode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme';
+  ecoThermalMode?: boolean;
+  flowScaleMode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme' | 'high' | 'max';
+  subframeBufferResMode?: 'auto' | '720p' | '1080p' | '1440p';
   interpEnabled: boolean;
   interpMode: 'off' | 'blend' | 'optical';
   targetFps: 60 | 90 | 120 | 144 | 'auto';
@@ -97,10 +124,19 @@ export interface ProcessorPresetSettings {
   subframeCoherenceGuard?: number;
   sceneCutProtection: boolean;
   videoBrightness?: number;
+  videoContrast?: number;
+  videoSaturation?: number;
+  videoBlackPoint?: number;
+  debandEnabled?: boolean;
+  debandStrength?: number;
+  lutPreset?: 'off' | 'teal_orange' | 'kodak_2383' | 'anime_vibrant' | 'cyberpunk' | 'custom';
+  lutStrength?: number;
   eqEnabled?: boolean;
   eqPreset?: 'flat' | 'cinema' | 'bass' | 'vocal' | 'treble';
   preampGain?: number;
   eqBands?: [number, number, number, number, number];
+  audioCompressorMode?: 'off' | 'soft' | 'night' | 'voice';
+  headphoneCrossfeed?: boolean;
 }
 
 export interface UserCustomPreset {
@@ -138,17 +174,28 @@ export const DEFAULT_APP_SETTINGS: PersistedAppSettings = {
   volume: 0.8,
   isMuted: false,
   videoBrightness: 1.0,
+  videoContrast: 1.0,
+  videoSaturation: 1.0,
+  videoBlackPoint: 0.0,
+  debandEnabled: true,
+  debandStrength: 0.65,
+  ambilightEnabled: true,
+  autoCropBlackBars: false,
+  lutPreset: 'off',
+  lutStrength: 0.85,
   hdrEnabled: false,
   hdrStrength: 1.0,
   upscaleEnabled: true,
   upscaleMode: 'gsr',
   upscaleFactor: 'auto',
-  upscaleSharpness: 0.9,
-  upscaleDenoise: 0.35,
+  upscaleSharpness: 0.85,
+  upscaleDenoise: 0.65,
   adrenoMode: 'auto',
   adrenoGmemFp16: true,
   adrenoTrue10Hdr: true,
+  ecoThermalMode: true,
   flowScaleMode: 'auto',
+  subframeBufferResMode: 'auto',
   processorMenuCollapsed: false,
   topToolbarCollapsed: false,
   fsToolbarCollapsed: false,
@@ -165,7 +212,7 @@ export const DEFAULT_APP_SETTINGS: PersistedAppSettings = {
   targetFps: 'auto',
   interpStrength: 1.0,
   motionScale: 20,
-  dejudderHaloControl: 40,
+  dejudderHaloControl: 70,
   subframeCascadeEnabled: true,
   subframeCascadeMode: 'auto',
   subframeCoherenceGuard: 75,
@@ -176,6 +223,7 @@ export const DEFAULT_APP_SETTINGS: PersistedAppSettings = {
   sceneCutProtection: true,
   splitCompareMode: false,
   subtitlesEnabled: true,
+  secondarySubtitlesEnabled: true,
   subFontSize: 18,
   subDelaySec: 0.0,
   subBgOpacity: 0.72,
@@ -184,11 +232,14 @@ export const DEFAULT_APP_SETTINGS: PersistedAppSettings = {
   preampGain: 1.0,
   pitchCorrection: true,
   eqBands: [0, 0, 0, 0, 0],
+  audioCompressorMode: 'off',
+  headphoneCrossfeed: false,
   autoPlayNext: true,
   loopPlayback: true,
   rememberPosition: true,
   autoBindMediaOnStart: true,
   showTopHud: true,
+  showHudTelemetryGraph: true,
   showStepButtons: true,
   showSnapshotBtn: true,
   doubleTapSeekSec: 5,
@@ -233,13 +284,29 @@ function sanitizeUpscaleFactor(rawFactor: unknown): 'auto' | 1.5 | 2.0 | 4.0 {
 
 function sanitizeFlowScaleMode(
   rawMode: unknown
-): 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme' {
+): 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme' | 'high' | 'max' {
   if (
     rawMode === 'auto' ||
     rawMode === 'performance' ||
     rawMode === 'balanced' ||
     rawMode === 'ultra' ||
-    rawMode === 'extreme'
+    rawMode === 'extreme' ||
+    rawMode === 'high' ||
+    rawMode === 'max'
+  ) {
+    return rawMode;
+  }
+  return 'auto';
+}
+
+function sanitizeSubframeBufferResMode(
+  rawMode: unknown
+): 'auto' | '720p' | '1080p' | '1440p' {
+  if (
+    rawMode === 'auto' ||
+    rawMode === '720p' ||
+    rawMode === '1080p' ||
+    rawMode === '1440p'
   ) {
     return rawMode;
   }
@@ -278,6 +345,7 @@ export function loadPersistedSettings(): PersistedAppSettings {
       upscaleMode?: unknown;
       upscaleFactor?: unknown;
       flowScaleMode?: unknown;
+      subframeBufferResMode?: unknown;
       motionScale?: unknown;
       subframeCascadeMode?: unknown;
       subframeCoherenceGuard?: unknown;
@@ -289,6 +357,7 @@ export function loadPersistedSettings(): PersistedAppSettings {
       upscaleMode: sanitizeUpscaleMode(parsed.upscaleMode),
       upscaleFactor: sanitizeUpscaleFactor(parsed.upscaleFactor),
       flowScaleMode: sanitizeFlowScaleMode(parsed.flowScaleMode),
+      subframeBufferResMode: sanitizeSubframeBufferResMode(parsed.subframeBufferResMode),
       motionScale: sanitizeMotionScale(parsed.motionScale),
       subframeCascadeMode: sanitizeSubframeCascadeMode(parsed.subframeCascadeMode),
       subframeCoherenceGuard: sanitizeSubframeCoherenceGuard(parsed.subframeCoherenceGuard),
@@ -356,6 +425,7 @@ export function loadUserPresets(): UserCustomPreset[] {
         upscaleMode: sanitizeUpscaleMode(p?.settings?.upscaleMode),
         upscaleFactor: sanitizeUpscaleFactor(p?.settings?.upscaleFactor),
         flowScaleMode: sanitizeFlowScaleMode(p?.settings?.flowScaleMode),
+        subframeBufferResMode: sanitizeSubframeBufferResMode(p?.settings?.subframeBufferResMode),
         motionScale: sanitizeMotionScale(p?.settings?.motionScale),
         subframeCascadeMode: sanitizeSubframeCascadeMode(p?.settings?.subframeCascadeMode),
         subframeCoherenceGuard: sanitizeSubframeCoherenceGuard(p?.settings?.subframeCoherenceGuard)
@@ -569,13 +639,17 @@ export async function loadDirectoryHandleFromVault(): Promise<{
   }
 }
 
-export async function saveSubtitlesToVault(name: string, cues: SubtitleCue[]): Promise<void> {
+export async function saveSubtitlesToVault(
+  name: string,
+  cues: SubtitleCue[],
+  slot: 'primary' | 'secondary' = 'primary'
+): Promise<void> {
   try {
     const db = await openMediaVaultDb();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_SUBTITLES, 'readwrite');
       tx.objectStore(STORE_SUBTITLES).put({
-        id: 'last_subtitles',
+        id: slot === 'secondary' ? 'secondary_subtitles' : 'last_subtitles',
         name,
         cues,
         updatedAt: Date.now()
@@ -588,7 +662,9 @@ export async function saveSubtitlesToVault(name: string, cues: SubtitleCue[]): P
   }
 }
 
-export async function loadSubtitlesFromVault(): Promise<{
+export async function loadSubtitlesFromVault(
+  slot: 'primary' | 'secondary' = 'primary'
+): Promise<{
   name: string;
   cues: SubtitleCue[];
 } | null> {
@@ -597,7 +673,9 @@ export async function loadSubtitlesFromVault(): Promise<{
     const res = await new Promise<{ name: string; cues: SubtitleCue[] } | null>(
       (resolve, reject) => {
         const tx = db.transaction(STORE_SUBTITLES, 'readonly');
-        const req = tx.objectStore(STORE_SUBTITLES).get('last_subtitles');
+        const req = tx
+          .objectStore(STORE_SUBTITLES)
+          .get(slot === 'secondary' ? 'secondary_subtitles' : 'last_subtitles');
         req.onsuccess = () => {
           if (req.result && Array.isArray(req.result.cues) && req.result.cues.length > 0) {
             resolve({ name: String(req.result.name), cues: req.result.cues });
@@ -613,3 +691,25 @@ export async function loadSubtitlesFromVault(): Promise<{
     return null;
   }
 }
+
+const BOOKMARKS_STORAGE_KEY = 'rex_video_bookmarks_v1';
+
+export function loadAllVideoBookmarks(): Record<string, VideoBookmark[]> {
+  try {
+    const raw = localStorage.getItem(BOOKMARKS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveAllVideoBookmarks(bookmarksMap: Record<string, VideoBookmark[]>): void {
+  try {
+    localStorage.setItem(BOOKMARKS_STORAGE_KEY, JSON.stringify(bookmarksMap));
+  } catch {
+    // Ignore
+  }
+}
+
