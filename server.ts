@@ -276,6 +276,23 @@ async function startServer() {
 
   app.use(express.json());
 
+  // 0. Serve exact version-matched ONNX Runtime Web WASM & WebGPU JSEP binaries from node_modules
+  const ortDistPath = path.join(process.cwd(), 'node_modules', 'onnxruntime-web', 'dist');
+  app.use(
+    '/ort-wasm',
+    express.static(ortDistPath, {
+      setHeaders: (res, filePath) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        if (filePath.endsWith('.wasm')) {
+          res.setHeader('Content-Type', 'application/wasm');
+        } else if (filePath.endsWith('.mjs') || filePath.endsWith('.js')) {
+          res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+        }
+      }
+    })
+  );
+
   // 1. Anixart Release & Episode Directory Endpoint
   app.get('/api/anixart/release/:releaseId', async (req, res) => {
     try {

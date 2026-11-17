@@ -1,55 +1,56 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *, .dark-theme, .dark-theme *));
 
 :root {
-  --bg-app: #f7f7f9;
-  --bg-grad: linear-gradient(180deg, #fafafa 0%, #f2f2f6 52%, #e9e9ef 100%);
-  --surface-card: #ededf1;
-  --surface-card-hover: #e3e3ea;
+  --bg-app: #f7f7f7;
+  --bg-grad: linear-gradient(180deg, #ffffff 0%, #f5f5f5 52%, #ebebeb 100%);
+  --surface-card: #efefef;
+  --surface-card-hover: #e5e5e5;
   --surface-elevated: #ffffff;
-  --surface-pill: #e1e1e7;
-  --surface-icon: #dfdfe5;
-  --folder-fill: #9e9ea4;
-  --badge-bg: #f5d8da;
-  --badge-text: #4a1c20;
-  --text-main: #141417;
-  --text-sub: #5b5b64;
-  --text-muted: #85858f;
-  --accent-bg: #18181c;
+  --surface-pill: #e2e2e2;
+  --surface-icon: #e0e0e0;
+  --folder-fill: #8c8c8c;
+  --badge-bg: #e5e5e5;
+  --badge-text: #111111;
+  --text-main: #0a0a0a;
+  --text-sub: #525252;
+  --text-muted: #737373;
+  --accent-bg: #0a0a0a;
   --accent-text: #ffffff;
-  --fab-bg: linear-gradient(145deg, #e4e4e9 0%, #d4d4dc 100%);
-  --fab-icon: #141417;
-  --nav-bg: #f2f2f5;
-  --nav-pill: #e0e0e6;
-  --border-soft: rgba(0, 0, 0, 0.06);
-  --border-strong: rgba(0, 0, 0, 0.15);
-  --shadow-fab: 0 12px 28px rgba(0, 0, 0, 0.16), 0 2px 6px rgba(0, 0, 0, 0.08);
+  --fab-bg: #0a0a0a;
+  --fab-icon: #ffffff;
+  --nav-bg: rgba(245, 245, 245, 0.94);
+  --nav-pill: #dcdcdc;
+  --border-soft: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.22);
+  --shadow-fab: 0 12px 28px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.1);
   --m3-standard: cubic-bezier(0.2, 0, 0, 1);
   --m3-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 html.dark-theme, .dark {
-  --bg-app: #0c0c0f;
-  --bg-grad: linear-gradient(180deg, #131318 0%, #0b0b0e 55%, #15151b 100%);
-  --surface-card: #1b1b20;
-  --surface-card-hover: #24242b;
-  --surface-elevated: #16161b;
-  --surface-pill: #282830;
-  --surface-icon: #26262e;
-  --folder-fill: #6e6e77;
-  --badge-bg: #4a2b2f;
-  --badge-text: #f9dadd;
-  --text-main: #f4f4f6;
-  --text-sub: #a0a0ab;
-  --text-muted: #6e6e78;
-  --accent-bg: #f4f4f6;
-  --accent-text: #0c0c0f;
-  --fab-bg: linear-gradient(145deg, #2e2e36 0%, #1f1f25 100%);
-  --fab-icon: #ffffff;
-  --nav-bg: #141418;
-  --nav-pill: #2c2c35;
-  --border-soft: rgba(255, 255, 255, 0.07);
-  --border-strong: rgba(255, 255, 255, 0.18);
-  --shadow-fab: 0 14px 32px rgba(0, 0, 0, 0.55);
+  --bg-app: #050505;
+  --bg-grad: linear-gradient(180deg, #080808 0%, #030303 55%, #0a0a0a 100%);
+  --surface-card: #111111;
+  --surface-card-hover: #191919;
+  --surface-elevated: #161616;
+  --surface-pill: #222222;
+  --surface-icon: #1f1f1f;
+  --folder-fill: #737373;
+  --badge-bg: rgba(255, 255, 255, 0.12);
+  --badge-text: #f5f5f5;
+  --text-main: #fafafa;
+  --text-sub: #a3a3a3;
+  --text-muted: #737373;
+  --accent-bg: #ffffff;
+  --accent-text: #000000;
+  --fab-bg: #ffffff;
+  --fab-icon: #000000;
+  --nav-bg: rgba(8, 8, 8, 0.94);
+  --nav-pill: rgba(255, 255, 255, 0.16);
+  --border-soft: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.24);
+  --shadow-fab: 0 14px 32px rgba(0, 0, 0, 0.65), 0 4px 12px rgba(0, 0, 0, 0.5);
 }
 
 * {
@@ -64,7 +65,7 @@ button, a, input, select, label, [role="button"] {
 body {
   margin: 0;
   padding: 0;
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   background: var(--bg-grad);
   color: var(--text-main);
   min-height: 100vh;
@@ -73,13 +74,19 @@ body {
 }
 
 .rex-serif {
-  font-family: 'Merriweather', Georgia, serif;
+  font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
   letter-spacing: -0.02em;
 }
 
 .font-mono-code {
   font-family: 'JetBrains Mono', monospace;
   font-variant-numeric: tabular-nums;
+}
+
+.rex-card {
+  background-color: var(--surface-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 20px;
 }
 
 .m3-group {
@@ -110,12 +117,12 @@ body {
 }
 
 .m3-group > .m3-setting-item:only-child {
-  border-radius: 26px;
+  border-radius: 24px;
 }
 
 .m3-group > .m3-setting-item:first-child:not(:only-child) {
-  border-top-left-radius: 26px;
-  border-top-right-radius: 26px;
+  border-top-left-radius: 24px;
+  border-top-right-radius: 24px;
   border-bottom-left-radius: 8px;
   border-bottom-right-radius: 8px;
 }
@@ -127,8 +134,8 @@ body {
 .m3-group > .m3-setting-item:last-child:not(:only-child) {
   border-top-left-radius: 8px;
   border-top-right-radius: 8px;
-  border-bottom-left-radius: 26px;
-  border-bottom-right-radius: 26px;
+  border-bottom-left-radius: 24px;
+  border-bottom-right-radius: 24px;
 }
 
 .m3-icon-box {

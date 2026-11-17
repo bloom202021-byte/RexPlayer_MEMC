@@ -15,8 +15,8 @@ export interface VideoBookmark {
 }
 
 export interface PersistedAppSettings {
-  activeScreen: 'main' | 'settings' | 'player';
-  activeTab: 'home' | 'you';
+  activeScreen: 'main' | 'settings' | 'player' | 'expert';
+  activeTab: 'home' | 'library' | 'you';
   darkTheme: boolean;
   compactGrid: boolean;
   aspectMode: 'contain' | 'cover' | 'fill';
@@ -58,7 +58,7 @@ export interface PersistedAppSettings {
     fineTune: boolean;
   };
   interpEnabled: boolean;
-  interpMode: 'off' | 'blend' | 'optical';
+  interpMode: 'off' | 'blend' | 'optical' | 'rife';
   targetFps: 60 | 90 | 120 | 144 | 'auto';
   interpStrength: number;
   motionScale: number;
@@ -96,6 +96,13 @@ export interface PersistedAppSettings {
   swipeVolumeBright: boolean;
   longPressSpeed2x: boolean;
   videoOutputMode: 'webgl_direct' | 'video_fallback';
+  gpuBackendMode: 'auto' | 'webgpu' | 'webgl2' | 'wasm';
+  interpMultiplierMode: 'auto' | 2 | 3 | 4;
+  performanceProfile: 'performance' | 'balanced' | 'quality';
+  processingResMode: 'auto' | '540p' | '720p' | '1080p';
+  rifeEngineMode: 'hybrid_webgpu_ifnet' | 'onnx_runtime_rife';
+  autoPerfScaling: boolean;
+  useWebCodecsDecoder: boolean;
   lastActiveVideoId: string;
 }
 
@@ -114,7 +121,7 @@ export interface ProcessorPresetSettings {
   flowScaleMode: 'auto' | 'performance' | 'balanced' | 'ultra' | 'extreme' | 'high' | 'max';
   subframeBufferResMode?: 'auto' | '720p' | '1080p' | '1440p';
   interpEnabled: boolean;
-  interpMode: 'off' | 'blend' | 'optical';
+  interpMode: 'off' | 'blend' | 'optical' | 'rife';
   targetFps: 60 | 90 | 120 | 144 | 'auto';
   interpStrength: number;
   motionScale: number;
@@ -167,7 +174,7 @@ const PRESETS_STORAGE_KEY = 'rex_user_presets_v2';
 export const DEFAULT_APP_SETTINGS: PersistedAppSettings = {
   activeScreen: 'main',
   activeTab: 'home',
-  darkTheme: false,
+  darkTheme: true,
   compactGrid: false,
   aspectMode: 'contain',
   playbackRate: 1.0,
@@ -196,26 +203,26 @@ export const DEFAULT_APP_SETTINGS: PersistedAppSettings = {
   ecoThermalMode: true,
   flowScaleMode: 'auto',
   subframeBufferResMode: 'auto',
-  processorMenuCollapsed: false,
+  processorMenuCollapsed: true,
   topToolbarCollapsed: false,
   fsToolbarCollapsed: false,
   transportCollapsed: false,
   collapsedSections: {
-    adreno: false,
-    memc: false,
-    hdr: false,
-    upscale: false,
-    fineTune: false
+    adreno: true,
+    memc: true,
+    hdr: true,
+    upscale: true,
+    fineTune: true
   },
   interpEnabled: true,
-  interpMode: 'optical',
+  interpMode: 'rife',
   targetFps: 'auto',
   interpStrength: 1.0,
-  motionScale: 20,
-  dejudderHaloControl: 70,
+  motionScale: 24,
+  dejudderHaloControl: 65,
   subframeCascadeEnabled: true,
   subframeCascadeMode: 'auto',
-  subframeCoherenceGuard: 75,
+  subframeCoherenceGuard: 70,
   detectedDisplayHz: 60,
   monochromeFilter: false,
   showVectors: false,
@@ -246,14 +253,21 @@ export const DEFAULT_APP_SETTINGS: PersistedAppSettings = {
   swipeVolumeBright: true,
   longPressSpeed2x: true,
   videoOutputMode: 'webgl_direct',
+  gpuBackendMode: 'auto',
+  interpMultiplierMode: 'auto',
+  performanceProfile: 'balanced',
+  processingResMode: 'auto',
+  rifeEngineMode: 'hybrid_webgpu_ifnet',
+  autoPerfScaling: true,
+  useWebCodecsDecoder: true,
   lastActiveVideoId: ''
 };
 
-function sanitizeInterpMode(rawMode: unknown): 'off' | 'blend' | 'optical' {
-  if (rawMode === 'off' || rawMode === 'blend' || rawMode === 'optical') {
+function sanitizeInterpMode(rawMode: unknown): 'off' | 'blend' | 'optical' | 'rife' {
+  if (rawMode === 'off' || rawMode === 'blend' || rawMode === 'optical' || rawMode === 'rife') {
     return rawMode;
   }
-  return 'optical';
+  return 'rife';
 }
 
 function sanitizeUpscaleMode(
@@ -336,6 +350,13 @@ function sanitizeSubframeCoherenceGuard(rawVal: unknown): number {
   return DEFAULT_APP_SETTINGS.subframeCoherenceGuard;
 }
 
+function sanitizeGpuBackendMode(rawMode: unknown): 'auto' | 'webgpu' | 'webgl2' | 'wasm' {
+  if (rawMode === 'auto' || rawMode === 'webgpu' || rawMode === 'webgl2' || rawMode === 'wasm') {
+    return rawMode;
+  }
+  return 'auto';
+}
+
 export function loadPersistedSettings(): PersistedAppSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
@@ -349,11 +370,22 @@ export function loadPersistedSettings(): PersistedAppSettings {
       motionScale?: unknown;
       subframeCascadeMode?: unknown;
       subframeCoherenceGuard?: unknown;
+      rifeV4Migrated?: boolean;
+      amoledThemeMigrated?: boolean;
     };
+    const migratedInterpMode =
+      !parsed.rifeV4Migrated && (parsed.interpMode === 'optical' || !parsed.interpMode)
+        ? 'rife'
+        : sanitizeInterpMode(parsed.interpMode);
     return {
       ...DEFAULT_APP_SETTINGS,
       ...parsed,
-      interpMode: sanitizeInterpMode(parsed.interpMode),
+      darkTheme: !parsed.amoledThemeMigrated ? true : (parsed.darkTheme ?? true),
+      processorMenuCollapsed: !parsed.amoledThemeMigrated
+        ? true
+        : (parsed.processorMenuCollapsed ?? true),
+      interpEnabled: !parsed.rifeV4Migrated ? true : (parsed.interpEnabled ?? true),
+      interpMode: migratedInterpMode,
       upscaleMode: sanitizeUpscaleMode(parsed.upscaleMode),
       upscaleFactor: sanitizeUpscaleFactor(parsed.upscaleFactor),
       flowScaleMode: sanitizeFlowScaleMode(parsed.flowScaleMode),
@@ -361,10 +393,13 @@ export function loadPersistedSettings(): PersistedAppSettings {
       motionScale: sanitizeMotionScale(parsed.motionScale),
       subframeCascadeMode: sanitizeSubframeCascadeMode(parsed.subframeCascadeMode),
       subframeCoherenceGuard: sanitizeSubframeCoherenceGuard(parsed.subframeCoherenceGuard),
-      collapsedSections: {
-        ...DEFAULT_APP_SETTINGS.collapsedSections,
-        ...(parsed.collapsedSections || {})
-      },
+      gpuBackendMode: sanitizeGpuBackendMode((parsed as { gpuBackendMode?: unknown }).gpuBackendMode),
+      collapsedSections: !parsed.amoledThemeMigrated
+        ? DEFAULT_APP_SETTINGS.collapsedSections
+        : {
+            ...DEFAULT_APP_SETTINGS.collapsedSections,
+            ...(parsed.collapsedSections || {})
+          },
       eqBands:
         Array.isArray(parsed.eqBands) && parsed.eqBands.length === 5
           ? (parsed.eqBands as [number, number, number, number, number])
@@ -377,7 +412,10 @@ export function loadPersistedSettings(): PersistedAppSettings {
 
 export function savePersistedSettings(settings: PersistedAppSettings): void {
   try {
-    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ ...settings, rifeV4Migrated: true, amoledThemeMigrated: true })
+    );
   } catch {
     // Ignore storage quota errors
   }
